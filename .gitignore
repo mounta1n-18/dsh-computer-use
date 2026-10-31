@@ -1,0 +1,11 @@
+# 运行目录与打包产物
+*.tgz
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 本地运行残留
+dsh-computer-use.lock
+*.log
+shots/

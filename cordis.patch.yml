@@ -1,0 +1,6 @@
+# 把本插件挂进 profile 的条目树。
+# `insert` 是官方支持的安装方式（plugin_manager install_bundle 会把它折叠进 profile）；
+# 不要手改 profile 的 package.json / pnpm-lock.yaml。
+- insert:
+    - id: computer-use
+      name: "@local/dsh-computer-use"

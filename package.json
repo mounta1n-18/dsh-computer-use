@@ -1,0 +1,42 @@
+{
+  "name": "@local/dsh-computer-use",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Computer-use / browser-use for DSH: resident Python service, direct PNG tool results, UIA element layer, Windows virtual desktops, CDP browser plane.",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/**",
+    "python/**",
+    "skills/**",
+    "scripts/**",
+    "tests/**",
+    "docs/**",
+    "cordis.patch.yml",
+    "README.md",
+    "INSTALL.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "computer-use",
+    "browser-use",
+    "cdp",
+    "uia",
+    "windows"
+  ]
+}
