@@ -51,6 +51,9 @@ powershell -ExecutionPolicy Bypass -File <仓库>\scripts\pack.ps1
 # 产出 local-dsh-computer-use-<version>.tgz
 ```
 
+不想自己打包：直接下 [最新 Release 的 tgz](https://github.com/mounta1n-18/dsh-computer-use/releases/latest)，
+把 `target` 指向它即可（先把文件存到 `<仓库外>/dsh-computer-use-1.0.0.tgz`，不要留在 `%TEMP%`，重装前别清理临时目录）。
+
 ```jsonc
 plugin_manager { "action": "install_bundle", "target": "<绝对路径>\\local-dsh-computer-use-1.0.0.tgz" }
 ```

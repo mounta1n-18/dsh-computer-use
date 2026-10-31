@@ -65,8 +65,10 @@
 plugin_manager { "action": "install_bundle", "target": "<本仓库的绝对路径>" }
 ```
 
-完整步骤（含无 `plugin_manager` 时的兜底、发布模式 tarball、卸载回滚、自检清单）见
-[INSTALL.md](INSTALL.md)。
+也可以装发布包（装完仓库可删可移）：下 [Release 的 tgz](https://github.com/mounta1n-18/dsh-computer-use/releases/latest)，
+`install_bundle` 指向它。
+
+完整步骤（含无 `plugin_manager` 时的兜底、卸载回滚、自检清单、换机踩坑）见 [INSTALL.md](INSTALL.md)。
 
 装完自检：
 
