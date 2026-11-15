@@ -33,7 +33,7 @@ cu.py — 看屏幕、动鼠标、敲键盘、开应用、管窗口。
 
 退出码 0 成功 / 2 失败；失败时 stderr 首行形如 [CU_XXX] 说明，按码决定恢复策略。
 """
-import argparse, atexit, ctypes, io, json, os, re, shlex, shutil, struct, subprocess, sys, tempfile, time
+import argparse, atexit, ctypes, io, json, os, re, shlex, shutil, struct, subprocess, sys, tempfile, threading, time
 
 # 依赖缺失时给**可执行**的命令，而不是一句"缺少依赖"。对齐豆包 agent_infra 的做法：
 # 环境不合法要报出"缺什么、怎么补"，不能静默降级。
@@ -99,6 +99,13 @@ CODES = {
     "CU_NO_SIDECAR": "UIA 常驻子进程不可用，元素级能力降级；可用 shot 看图路线",
     "CU_DEP_MISSING": "缺少 Python 依赖，按提示的 pip 命令装",
     "CU_CONFIRM_REQUIRED": "这个动作有破坏性，必须显式确认（--confirm / confirm:true）才执行",
+    "CU_NOT_ACTIVATED": "电脑控制没有激活：先 activate 并得到用户同意，再操作；不要重试原动作",
+    "CU_LEASE_EXPIRED": "控制权已过期（空闲超时或单次上限），重新 activate 再继续",
+    "CU_BUSY": "另一个代理正持有控制权，等它 deactivate 或由用户手动关闭",
+    "CU_EMERGENCY_STOP": "用户手动关闭了电脑控制；不要重试或绕过，等用户明确恢复",
+    "CU_ACTIVATION_DENIED": "用户拒绝了激活请求；不要立刻再弹一次，先问用户想怎么做",
+    "CU_PAUSED": "用户按了暂停（Ctrl+Shift+Alt），正在等你回话或自己接手；不要重试，等用户恢复",
+    "CU_NO_OVERLAY": "桌面提示层起不来（缺少 tkinter 或桌面不可用），激活被拒绝以防无提示地抢控制权",
 
 
 }
@@ -111,6 +118,159 @@ class CuError(Exception):
             msg += "：" + detail
         super().__init__(msg)
         self.code = code
+
+
+# ---------------------------------------------------------------- 控制权（激活 / 租约 / 急停）
+# 为什么要把"谁能动鼠标"做成进程级状态，而不是再写一段提示词：
+# 提示词是**建议**，agent 忘一次就抢一次鼠标；这里的检查是**闸门**，忘不忘都过不去。
+#
+# 语义：
+# - enabled=False（CLI 直接跑 cu.py）时全部放行——命令行是用户自己在用，不该被拦。
+# - 服务模式下 activate 成功后发一张"租约"（lease），所有注入与动界面的命令都要查它。
+# - 空闲 idle_ttl 秒没有任何操作 → 自动收回；单次最长 max_ttl 秒 → 强制收回。
+# - 急停（emergency）优先级最高：一旦置位，连租约一起作废，只有用户再按一次热键能解。
+class Control:
+    def __init__(self):
+        self.enabled = False
+        self.emergency = False
+        self.lease = None
+        self._bypass = 0
+        self._lock = threading.RLock()
+        self.idle_ttl = _env_float("DSH_CU_IDLE_TTL", 120.0)
+        self.max_ttl = _env_float("DSH_CU_MAX_TTL", 1800.0)
+        self.pending = None          # 正在等用户同意的请求（仅服务端用）
+        self.paused = False          # 用户按了暂停键：保留租约，但停止一切注入
+        self.paused_at = 0.0
+        self.visual_check = None     # 服务端注入的可调用对象：提示层是否真的在屏上见
+
+    def set_paused(self, on, reason=""):
+        """暂停：保留租约（不用重新授权），但注入一律返回 CU_PAUSED。"""
+        with self._lock:
+            on = bool(on)
+            if on and not self.paused:
+                self.paused_at = time.time()
+            if not on:
+                self.paused_at = 0.0
+            self.paused = on
+
+    # ---- 查询 ----
+    def status(self):
+        with self._lock:
+            now = time.time()
+            L = self.lease
+            left_idle = left_max = 0
+            if L:
+                left_idle = max(0, int(round(L["last"] + self.idle_ttl - now)))
+                left_max = max(0, int(round(L["max_deadline"] - now)))
+            return {
+                "enabled": self.enabled,
+                "emergency": self.emergency,
+                "active": bool(L and not self.emergency),
+                "owner": (L or {}).get("owner"),
+                "lease_id": (L or {}).get("id"),
+                "idle_left": left_idle,
+                "max_left": left_max,
+                "idle_ttl": self.idle_ttl,
+                "max_ttl": self.max_ttl,
+                "pending": (self.pending or {}).get("owner"),
+                "paused": self.paused,
+                "paused_seconds": int(time.time() - self.paused_at) if self.paused else 0,
+            }
+
+    # ---- 闸门 ----
+    def check(self):
+        """所有会动用户桌面的动作都必须先过这里。读屏/剪贴板读取不过。"""
+        if not self.enabled or self._bypass:
+            return
+        if self.emergency:
+            raise CuError("CU_EMERGENCY_STOP", "")
+        if self.paused:
+            raise CuError("CU_PAUSED", "")
+        # 只有"提示层确实在屏幕上"时才允许注入。这条是用户要求的硬等价：
+        # 屏幕上没有提示 = 这台电脑此刻不该被 agent 动。
+        if self.visual_check is not None and not self.visual_check():
+            raise CuError("CU_NO_OVERLAY", "")
+        with self._lock:
+            if self.emergency:
+                raise CuError("CU_EMERGENCY_STOP", "")
+            L = self.lease
+            if not L:
+                raise CuError("CU_NOT_ACTIVATED", "")
+            now = time.time()
+            if now - L["last"] > self.idle_ttl:
+                self.lease = None
+                raise CuError("CU_LEASE_EXPIRED",
+                              "空闲超过 %d 秒" % int(self.idle_ttl))
+            if now > L["max_deadline"]:
+                self.lease = None
+                raise CuError("CU_LEASE_EXPIRED",
+                              "单次激活超过 %d 秒上限" % int(self.max_ttl))
+
+    def touch(self):
+        with self._lock:
+            if self.lease:
+                self.lease["last"] = time.time()
+
+    # ---- 生命周期（服务端调用）----
+    def grant(self, owner, owner_id=""):
+        with self._lock:
+            now = time.time()
+            self.lease = {"id": "%08x" % (int(now * 1000) & 0xFFFFFFFF),
+                          "owner": owner or "未命名代理",
+                          "owner_id": owner_id or "",
+                          "started": now, "last": now,
+                          "max_deadline": now + self.max_ttl}
+            self.emergency = False
+            self.paused = False
+            return dict(self.lease)
+
+    def revoke(self, reason=""):
+        with self._lock:
+            self.paused = False
+            L, self.lease = self.lease, None
+            if L:
+                L = dict(L)
+                L["reason"] = reason
+            return L
+
+    def trip_emergency(self):
+        """急停：作废租约、置急停位。返回被作废的租约（审计用）。"""
+        with self._lock:
+            L = self.revoke("emergency")
+            self.emergency = True
+            return L
+
+    def clear_emergency(self):
+        with self._lock:
+            self.emergency = False
+
+
+def _env_float(name, default):
+    try:
+        v = os.environ.get(name)
+        return float(v) if v else default
+    except (TypeError, ValueError):
+        return default
+
+
+_CONTROL = Control()
+
+
+class control_bypass:
+    """安全收尾用：松开按键、进程退出清理不能被自己的闸门挡住。"""
+
+    def __enter__(self):
+        _CONTROL._bypass += 1
+        return self
+
+    def __exit__(self, *exc):
+        _CONTROL._bypass -= 1
+        return False
+
+
+def control_gate(cmd=None):
+    """命令级闸门。`cmd` 只留给调用方排查用，不改变判定。"""
+    _CONTROL.check()
 
 
 # ---------------------------------------------------------------- 运行目录 / 审计
@@ -263,12 +423,15 @@ class INPUT(ctypes.Structure):
 
 
 def _send(inp):
+    # 注入总闸：所有点击/按键/滚轮最终都汇到这里（eval 里手写 cu._send 也跑不掉）。
+    _CONTROL.check()
     # UIPI 拦截时 SendInput 返回 0，GetLastError=5。这是唯一可靠的失败信号。
     if u32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) != 1:
         err = ctypes.get_last_error()
         if err == 5:
             raise CuError("CU_UIPI", "SendInput 返回 ERROR_ACCESS_DENIED")
         raise OSError("SendInput 失败，GetLastError=%d" % err)
+    _CONTROL.touch()
 
 
 def _mouse(flags, dx=0, dy=0, data=0):
@@ -308,6 +471,46 @@ def screen():
     """返回虚拟桌面 (x, y, w, h)。多屏时是整个拼接桌面的外接矩形。"""
     g = u32.GetSystemMetrics
     return g(76), g(77), g(78), g(79)
+
+
+def foreground_occludes_overlay():
+    """前台是不是一个"独占全屏"窗口——那种情况下我们的提示层画了也看不见。
+
+    判据（保守，只认最明确的形态）：
+      · 前台窗口不是我们的提示层，也不是桌面/任务栏；
+      · 它的窗口矩形把**它所在那块显示器**整个盖住；
+      · 它没有标题栏（WS_CAPTION）或没有任何非客户区——典型的全屏游戏/播放器。
+
+    命中时上层（cu_server）会当作"视觉不可达"：要么先别注入，要么直接收工，
+    这样"看不到提示层"与"cu 没在工作"始终一致。
+    """
+    hwnd = u32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    buf = ctypes.create_unicode_buffer(128)
+    u32.GetClassNameW(hwnd, buf, 128)
+    cls = buf.value
+    if cls in ("DshCuOverlay", "Progman", "WorkerW", "Shell_TrayWnd",
+               "Windows.UI.Core.CoreWindow"):
+        return False
+    style = u32.GetWindowLongW(hwnd, -16)
+    if style & 0x00C00000:                    # WS_CAPTION：有标题栏，多半是普通窗口
+        return False
+    rect = wintypes.RECT()
+    if not u32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return False
+    class _MI(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+    mi = _MI()
+    mi.cbSize = ctypes.sizeof(_MI)
+    mon = u32.MonitorFromWindow(hwnd, 2)      # MONITOR_DEFAULTTONEAREST
+    if not u32.GetMonitorInfoW(mon, ctypes.byref(mi)):
+        return False
+    m = mi.rcMonitor
+    covers = (rect.left <= m.left and rect.top <= m.top
+              and rect.right >= m.right and rect.bottom >= m.bottom)
+    return bool(covers)
 
 
 def _unit(v, name):
@@ -405,8 +608,8 @@ def click(nx, ny, right=False, double=False, triple=False):
     down, up = (RDOWN, RUP) if right else (LDOWN, LUP)
     n = 3 if triple else (2 if double else 1)
     for i in range(n):
-        _mouse(down)
-        _mouse(up)
+        _mouse_down(down)
+        _mouse_up(down)
         if i < n - 1:
             time.sleep(0.05)
     return x, y
@@ -423,7 +626,7 @@ def drag(nx1, ny1, nx2, ny2, ms=800):
     pause = (ms / 1000.0) / steps
     move(x1, y1)
     time.sleep(0.06)
-    _mouse(LDOWN)
+    _mouse_down(LDOWN)
     try:
         time.sleep(0.06)
         for i in range(1, steps + 1):
@@ -432,8 +635,8 @@ def drag(nx1, ny1, nx2, ny2, ms=800):
         time.sleep(0.08)      # 落点停顿：让目标应用确认悬停到位再松手
     finally:
         # 必须兜底松左键：中途被 Ctrl+C / 超时杀掉时，左键会永久按住在系统层，
-        # 之后所有鼠标动作都变成拖选。
-        _mouse(LUP)
+        # 之后所有鼠标动作都变成拖选。_mouse_up 只松"我们登记过"的键。
+        _mouse_up(LDOWN)
     return (x1, y1, x2, y2)
 
 
@@ -565,12 +768,13 @@ _PRESSED_MODS = set()
 
 
 def _mods_cleanup():
-    for n in tuple(_PRESSED_MODS):
-        try:
-            _key(VK[n], up=True)
-        except Exception:
-            pass
-    _PRESSED_MODS.clear()
+    with control_bypass():
+        for n in tuple(_PRESSED_MODS):
+            try:
+                _key(VK[n], up=True)
+            except Exception:
+                pass
+        _PRESSED_MODS.clear()
 
 
 atexit.register(_mods_cleanup)
@@ -586,29 +790,114 @@ def key_hold(name, down=True):
         _HELD.add(n)
     else:
         _HELD.discard(n)
+    _persist_held()
     return n
 
 
-def release_all(force=False):
-    """松开修饰键。force=True 无条件全松（独立的 release 命令用这个）；
-    默认只松本进程按下过的，免得把用户正按着的键也松开。"""
-    names = HOLDABLE if force else tuple(_HELD)
+# 鼠标键也登记：拖拽中途被打断时，左键会按在系统层（之后所有鼠标动作都变成拖选）。
+# 但"松手"只松**我们自己按下的**——绝不盲发抬起：孤立的 BUTTONUP 会被 Windows
+# 当成一次完整点击（2026-11-15 事故：用户一动鼠标，桌面就弹一次右键菜单）。
+_BTN_LABEL = {LDOWN: "鼠标左键", RDOWN: "鼠标右键"}
+_BTN_UP = {LDOWN: LUP, RDOWN: RUP}
+_HELD_BTNS = {}          # down 标志 -> 人话名字
+
+
+def _held_path():
+    return os.path.join(_home_dir(), "held.json")
+
+
+def _persist_held():
+    """把"按着什么"落到盘上。进程被强杀时 atexit 不会跑，下一个进程靠它收尾。"""
+    state = {"keys": sorted(_HELD), "buttons": sorted(_HELD_BTNS)}
+    p = _held_path()
+    try:
+        if not state["keys"] and not state["buttons"]:
+            if os.path.exists(p):
+                os.remove(p)
+            return
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def recover_held():
+    """新进程启动时收尾上一个进程的残局。
+
+    只松**记录里写着**的键——那是我们自己按下的；用户手里的键一律不碰。
+    没有记录就什么都不做（绝不猜"可能卡住了"）。"""
+    p = _held_path()
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    released = []
+    with control_bypass():
+        for flag in state.get("buttons") or []:
+            flag = int(flag)
+            if flag in _BTN_UP:
+                try:
+                    _mouse(_BTN_UP[flag])
+                    released.append(_BTN_LABEL[flag])
+                except OSError:
+                    pass
+        for name in state.get("keys") or []:
+            if name in VK:
+                try:
+                    _key(VK[name], up=True)
+                    released.append(name)
+                except OSError:
+                    pass
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+    return released
+
+
+def _mouse_down(flag):
+    _mouse(flag)
+    _HELD_BTNS[flag] = _BTN_LABEL[flag]
+    _persist_held()
+
+
+def _mouse_up(flag):
+    try:
+        _mouse(_BTN_UP[flag])
+    finally:
+        _HELD_BTNS.pop(flag, None)
+        _persist_held()
+
+
+def release_all():
+    """松开**本进程按下、还没松开**的键和鼠标键。
+
+    语义只有一条：**只碰自己按的**。所以它天然是幂等的——没按过就一个事件都不发，
+    既不会替用户松手，也不会凭空造出一次点击。
+
+    收尾动作不受控制权闸门约束：手动关闭/过期之后更要能把手松开。"""
     done = []
-    for n in names:
-        try:
-            _key(VK[n], up=True)
-            done.append(n)
-        except OSError:
-            pass
-    _HELD.clear()
-    if force:
-        # drag 被中断会在系统层留下按住的左键，release 一并覆盖鼠标键
-        for f, tag in ((LUP, "鼠标左键"), (RUP, "鼠标右键")):
+    with control_bypass():
+        for flag, label in tuple(_HELD_BTNS.items()):
             try:
-                _mouse(f)
-                done.append(tag)
+                _mouse(_BTN_UP[flag])
+                done.append(label)
             except OSError:
                 pass
+        _HELD_BTNS.clear()
+        for n in tuple(_HELD):
+            try:
+                _key(VK[n], up=True)
+                done.append(n)
+            except OSError:
+                pass
+        _HELD.clear()
+        _persist_held()
     return done
 
 
@@ -944,6 +1233,8 @@ def _force_foreground(hwnd, tries=3):
     Chromium 内核程序带着重草稿做窗口重排，实测把微信卡死过（AppHangB1，WER 级
     Critical）。遇到最小化就报错交回上层，让人来决定。
     """
+    # 置前 = 从用户手里抢走前台，和注入同等对待。
+    _CONTROL.check()
     if u32.IsIconic(hwnd):
         raise CuError("CU_MINIMIZED",
                       "目标窗口处于最小化。本脚本不替你还原窗口——切显示状态对 "
@@ -1460,9 +1751,9 @@ def capture_png(long_edge=1280, region=None):
     except Exception as e:
         if not on_input_desktop():
             raise CuError("CU_SHADOW_NO_SCREEN",
-                          "当前在**非输入桌面**（隔离桌面）上，GDI 抓不到屏幕。"
-                          "改用 shot --window <窗口名>（走 PrintWindow），"
-                          "或传 desktop:'main' 到用户桌面截屏。原始错误：%s" % (e or type(e).__name__))
+                          "当前不在可输入的桌面上（例如锁屏或安全桌面），GDI 抓不到屏幕。"
+                          "改用 shot --window <窗口名>（走 PrintWindow）。原始错误：%s"
+                          % (e or type(e).__name__))
         raise CuError("CU_SHOT_FAIL", str(e) or type(e).__name__)
     return _encode_png_img(img, long_edge, region, "gdi")
 
@@ -1671,9 +1962,8 @@ def capture_shot(a):
     # 有窗口就走 PrintWindow（不依赖屏幕），没窗口就明确报错，不硬试。
     if win is None and not on_input_desktop():
         raise CuError("CU_SHADOW_NO_SCREEN",
-                      "当前在隔离桌面（非输入桌面）上，抓不到“屏幕”。"
-                      "改用 shot window=<窗口名>（PrintWindow，不依赖屏幕），"
-                      "或传 desktop:'main'（需用户批准）到用户桌面截屏。")
+                      "当前不在可输入的桌面上（例如锁屏或安全桌面），抓不到“屏幕”。"
+                      "改用 shot window=<窗口名>（PrintWindow，不依赖屏幕）。")
 
     if win is not None:
         try:
@@ -3323,6 +3613,30 @@ def _uia():
 # 2026-10-27：虚拟桌面（desktop.py / _desktop / _fmt_desktop）整体移除，功能重做中。
 
 
+# 免控制权命令白名单：不碰用户的键盘鼠标、不抢前台，所以不需要激活。
+# 判据是"会不会动用户正在用的东西"，不是"是不是只读"：
+#   - 读类：shot/windows/find/apps…（只看）
+#   - 起进程但不置前：spawn（launch 会置前，仍在闸内）
+#   - 关窗口：app-terminate（用户已经要求关它，且不注入输入）
+#   - 安全收尾：release（任何状态下都必须能松开按键/鼠标）
+#   - 剪贴板：clip-set/clip-image 不改变焦点
+# 其余一律要控制权。漏一个的代价只是多拦一次，不会误放行。
+UNGUARDED_CMDS = {
+    "shot", "windows", "rect", "apps", "find", "app-is-running", "hybrid-programs",
+    "clip", "save-image", "where", "wait", "probe", "doctor", "setup",
+    "state-capture", "element-at", "resync", "码", "口径", "静默", "batch",
+    "watch", "盯", "收", "瞧",
+    # 起进程不注入输入、不置前
+    "spawn",
+    # 关窗口不注入输入（破坏性另有 confirm 闸）
+    "app-terminate",
+    # 安全收尾：任何状态下都必须能松开按键/鼠标
+    "release",
+    # 剪贴板读写不动界面；写入留痕即可
+    "clip-set", "clip-image",
+}
+
+
 def execute_namespace(a):
     """执行一条已解析的命令，返回输出行。
 
@@ -3330,6 +3644,9 @@ def execute_namespace(a):
     rejected 三态，只在这一处实现。两边各写一份的话，迟早会有一边忘了续静默窗，
     而那个 bug 的表现是"自己操作触发了自己的凝视队列"——很难查。
     """
+    # 控制权闸门放在最前面：没激活就不该产生任何副作用（连静默窗也别开）。
+    if a.cmd not in UNGUARDED_CMDS:
+        control_gate(a.cmd)
     inj = a.cmd in INJECT_CMDS
     # 审计集合比"注入集合"大：eval/spawn 不是注入，但它们能起进程、跑任意代码，
     # 是绕过 confirm 闸的主要路径——**必须留痕**，否则破坏性约束形同虚设。
@@ -3461,7 +3778,8 @@ def run(a):
         return ["已松开 %s" % key_hold(a.name, False)]
 
     if a.cmd == "release":
-        return ["已松开：%s" % "、".join(release_all(force=True))]
+        done = release_all()
+        return ["已松开：%s" % "、".join(done)] if done else ["没有按住任何键（不需要松开）"]
 
     if a.cmd == "paste":
         old = clip_get_soft()

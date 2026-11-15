@@ -9,3 +9,11 @@ __pycache__/
 dsh-computer-use.lock
 *.log
 shots/
+
+# 本地实验残留
+_backup/
+_preview/
+_dlg_*
+_probe_*
+_smoke_*
+_tmp_*

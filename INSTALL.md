@@ -1,58 +1,54 @@
-# INSTALL — 写给 agent 的安装指引
+# dsh-computer-use — 安装与使用
 
-> 这份文件是给**模型/agent** 看的，不是给人看的安装向导。人类只需要把仓库路径交给你。
-> 每一步都有"怎么确认这一步成了"，不要跳过验证。
-> 目标：让 `computer_use` 与 `browser_use` 出现在工具表里，并且 `shot` 能直接回图片。
+> **软安装（换一台机器、由 agent 代装）先读 [`AGENT-INSTALL.md`](AGENT-INSTALL.md)**：
+> 那一页给的是逐步流程、判定标准与常见坑；这一页讲功能和参数。
 
----
+把 `~/.dsh/skills/computer-use` 那套"CLI + 提示词"升级成的 **DSH Cordis 插件**：
+注册 `computer_use` / `browser_use` 两个工具，Python 侧是常驻服务，截图直接作为图片块返回。
 
-## 0. 先看环境（30 秒）
-
-```powershell
-node -v            # 需要 >= 22（用到原生 WebSocket / fetch）
-python -V          # 需要 >= 3.10
-python -c "import PIL, win32pipe; print('deps ok')"
-```
-
-缺 `pillow` / `pywin32` 时，插件自己能告诉你装什么：
-
-```powershell
-python <仓库>\python\cu.py setup            # 只打印命令
-python <仓库>\python\cu.py setup --install  # 真的装（默认不代劳）
-```
-
-**不要**在没有确认的情况下 `--install`——改用户 Python 环境属于偏重操作，先打印、问过再装。
+**零 Node 依赖、无构建步骤**：只用 `node:*` 内置模块 + Node 22+ 原生 `WebSocket`/`fetch`；
+Python 侧只需要 `pillow`（已有）+ `pywin32`（已有，命名管道用）。
 
 ---
 
-## 1. 安装（三条路，按优先级选）
-
-### A. 官方路径：`plugin_manager`（推荐）
-
-在 DSH 会话里调用（这是官方唯一支持的安装路径）：
-
-```jsonc
-plugin_manager { "action": "install_bundle", "target": "<仓库绝对路径>" }
-```
-
-- 依赖会被 pnpm 记成 `link:`，**本体就是仓库目录**：改 `index.js` / `python/*.py` 后重启 DSH 即生效；
-- 代价：**移动或删除仓库目录前必须先卸载**，否则该 profile 启动会报缺包。
-
-确认装上了：
-
-```jsonc
-plugin_manager { "action": "list_bundles" }        // 应看到 @local/dsh-computer-use
-```
-
-### B. 发布模式：tarball 独立副本（本体可删可移）
+## 1 前置条件（先跑一次自检）
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File <仓库>\scripts\pack.ps1
-# 产出 local-dsh-computer-use-<version>.tgz
+python <插件目录>\python\cu.py doctor
 ```
 
-不想自己打包：直接下 [最新 Release 的 tgz](https://github.com/mounta1n-18/dsh-computer-use/releases/latest)，
-把 `target` 指向它即可（先把文件存到 `<仓库外>/dsh-computer-use-1.0.0.tgz`，不要留在 `%TEMP%`，重装前别清理临时目录）。
+必需项：Python 3.10+、pillow、pywin32（Windows）。可选项（缺了只是降级，不影响装机）：
+UIA 元素层、虚拟桌面内部 COM、浏览器 CDP 端点。
+
+缺依赖时它会打印**可直接粘出去跑**的命令；也可以：
+
+```powershell
+python <插件目录>\python\cu.py setup            # 只打印命令
+python <插件目录>\python\cu.py setup --install  # 真的装（默认不代劳，改用户环境属于偏重操作）
+```
+
+---
+
+## 2 安装（两种模式，二选一）
+
+安装动作**只能**通过 DSH 的 `plugin_manager` 工具完成——这是官方唯一支持的路径
+（手改 profile 的 `package.json` / `pnpm-lock.yaml` 会留下不一致）。
+
+### A. 开发模式：文件夹链接安装（改代码即时生效）
+
+```jsonc
+plugin_manager { "action": "install_bundle", "target": "C:\\DSHprojects\\cu-improve\\dsh-plugin-computer-use" }
+```
+
+- pnpm 把依赖记成 `link:`，**本体始终是这个文件夹**：改 `index.js` / `python/*.py`
+  后重启 DSH（或刷新页面）即生效
+- 代价：**删除或移动这个文件夹前必须先卸载**，否则该 profile 启动时会报缺包
+
+### B. 发布模式：tarball 独立副本安装（本体可删可移）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File <插件目录>\scripts\pack.ps1
+```
 
 ```jsonc
 plugin_manager { "action": "install_bundle", "target": "<绝对路径>\\local-dsh-computer-use-1.0.0.tgz" }
@@ -60,78 +56,70 @@ plugin_manager { "action": "install_bundle", "target": "<绝对路径>\\local-ds
 
 升级：改 `package.json` 的 `version` → 重新 pack → 再 `install_bundle`。
 
-### C. 兜底：没有 `plugin_manager` 时
+### 装完要不要重启？
 
-只有当本机 DSH 没有暴露 `plugin_manager` 工具时才走这条。脚本会**先备份再改**，
-默认 dry-run，必须显式 `-Apply`：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File <仓库>\scripts\install-profile.ps1            # 只打印将要做的改动
-powershell -ExecutionPolicy Bypass -File <仓库>\scripts\install-profile.ps1 -Apply     # 真的改
-```
-
-它做两件事（只改 `<DSH_HOME>\profiles\<profile>\package.json`，带 `.bak-<时间戳>`）：
-
-1. `dependencies` 增加 `"@local/dsh-computer-use": "link:<仓库绝对路径>"`；
-2. `dsh.profile.bundles` 追加 `"@local/dsh-computer-use"`。
-
-改完需要**重启 DSH**（`plugin_manager` 没装成时，pnpm 的软链要等宿主下次解析依赖才建）。
-如果重启后工具仍不出现，说明这台 DSH 的依赖解析不认手改——回退到 A 或 B，并删除 `.bak` 之外的改动。
+插件加载属于**条目树变更**。多数情况下 DSH 会热重载；如果工具没出现，重启 DSH
+（或刷新页面）再看。**重启会结束当前会话，请先确认手头没有跑一半的活。**
 
 ---
 
-## 2. 装完必做的四项验证
+## 3 验证装好了
 
-```jsonc
-computer_use { "action": "doctor" }          // ① 必需项全 OK；缺什么它会直接给命令
-computer_use { "action": "shot" }            // ② 会话里应**直接渲染出图片**（不是文件路径）
-computer_use { "action": "server_status" }   // ③ running: true，能看到 transport
-computer_use { "action": "where" }           // ④ 光标像素 + 归一化坐标（输入链路通）
-```
-
-浏览器平面另测：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File <仓库>\scripts\chrome-debug.cmd   # 起带调试端口的 Chrome
-```
-
-```jsonc
-browser_use { "action": "status" }    // 应扫到端点
-browser_use { "action": "snapshot" }  // 应出 scope=dN … 与 dN:eM
-```
-
-四项里任何一项失败，先看 `computer_use { "action": "codes" }` 的错误码表，不要瞎试。
+1. **结构**：`cordis_inspect_query(host/Tool)` 里应能看到 `computer_use` 与 `browser_use`。
+2. **行为**（在本会话里直接调工具）：
+   - `computer_use{action:"doctor"}` → 必需项全 OK
+   - `computer_use{action:"shot"}` → **会话里直接渲染出图片**（不是文件路径）
+   - `computer_use{action:"where"}` → 光标像素 + 归一化坐标
+   - `computer_use{action:"state_capture"}` → 一串带 `e1..eN` 的元素
+   - `computer_use{action:"server_status"}` → `running: true`、`owned`、`transport`
+3. **浏览器平面**：先 `scripts\chrome-debug.cmd` 起一个带调试端口的 Chrome，
+   再 `browser_use{action:"status"}` 应扫到端点；`snapshot` 出 `scope=dN …` 与 `dN:eM`。
+4. **卸载后干净**：`plugin_manager remove_bundle` → 再跑
+   `scripts\rollback.ps1` 清运行目录，最后确认没有残留 `python.exe`。
 
 ---
 
-## 3. 卸载 / 回滚
+## 4 用起来是什么样
 
-```jsonc
-plugin_manager { "action": "remove_bundle", "target": "@local/dsh-computer-use" }
-```
+技能文本随插件下发（`computer_use` / `browser_use` 各自一份 SKILL.md），模型会自动加载。
+要点：
+
+- 坐标一律 **0-1000 归一化**；`region` / `at` 这类参数才吃物理像素。
+- `shot` 直接回图片、不落盘；要留证据才给 `out`。
+- 网页内优先 `browser_use`（吃可访问性树），本地应用/系统 UI 走 `computer_use`；
+  **一个工作流内平面固定**。
+- 等外部事件用 `watch_start` → `watch_recv`（后台排队、等待零 token），别连续截图。
+- 元素级：`state_capture` 拿 `eN`，`element eN --invoke` 走 UI Automation，比估坐标稳。
+- 结果带 `status`：`invalid_action` 改参数、`state_changed` 重新观察、`blocked` 请用户接管。
+- 应用/窗口：`app_is_running` 看有没有在跑；`app_resize` 只改尺寸；`app_terminate` 是破坏性
+  动作，**必须传 `confirm:true`** 否则返回 `CU_CONFIRM_REQUIRED`；`spawn` 直接起任意可执行
+  文件（不经 shell，参数原样传）；`hybrid_programs` 报告"哪些可见窗口其实是浏览器 + 有没有
+  CDP 端点"，用来决定走 cu 还是 bu。
+- 元素查找支持 `find{pattern, role, regex, exact, index}`，返回带 `eN` ref 的结构化结果。
+
+
+CLI 仍然完整可用（降级/调试）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File <仓库>\scripts\rollback.ps1
-# 回收残留 python 进程、松开 latch 的修饰键、删运行目录与截图缓存
+python <插件目录>\python\cu.py shot --long 800
+python <插件目录>\python\cu.py click 500 500
+python <插件目录>\python\cu.py state-capture --window 记事本
+python <插件目录>\python\cu.py 码          # 错误码表
 ```
-
-- 走 C 路线装的，还要把 `package.json` 从 `.bak-<时间戳>` 还原（脚本会打印要还原的路径）。
-- 检查 `<DSH_HOME>\profiles\<profile>\cordis.patch.yml` 是否残留 `- id: computer-use`，有就删。
-- 确认没有残留 `python.exe`：`Get-Process python -ErrorAction SilentlyContinue`。
 
 ---
 
-## 4. 环境变量（都在 `python/` 侧生效）
+## 5 环境变量
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `DSH_CU_TRANSPORT` | `named_pipe` / `uds` / `tcp` | Windows 命名管道，其它 UDS |
+| `DSH_CU_TRANSPORT` | `named_pipe` / `uds` / `tcp` | Windows 命名管道 / 其它 UDS |
 | `DSH_CU_ENDPOINT` | 管道名或 socket 路径 | `\\.\pipe\dsh-computer-use` |
 | `DSH_CU_PORT` | tcp 端口 | 无 |
-| `DSH_CU_FALLBACK_TRANSPORT` / `_PORT` | 兜底传输（tcp） | 空 |
+| `DSH_CU_FALLBACK_TRANSPORT` / `DSH_CU_FALLBACK_PORT` | 兜底传输（tcp） | 空 |
 | `DSH_CU_CONNECT_TIMEOUT` | 连接超时秒 | 5.0 |
 | `DSH_CU_IO_TIMEOUT` | 单请求 IO 超时秒 | 30 |
-| `DSH_CU_HOME` | 运行目录（审计 / 日志 / socket） | `%LOCALAPPDATA%\dsh-computer-use` |
+| `DSH_CU_HOME` | 运行目录（审计/日志/socket） | `%LOCALAPPDATA%\dsh-computer-use` |
 | `DSH_CU_PYTHON` | 指定 Python 绝对路径 | 自动探测 |
 | `DSH_CU_LAZY` | `1` = 首次调用才拉起服务 | 空（加载即拉起） |
 | `DSH_CU_DEBUG` | `1` = 插件往 stderr 打调试日志 | 空 |
@@ -139,33 +127,57 @@ powershell -ExecutionPolicy Bypass -File <仓库>\scripts\rollback.ps1
 
 ---
 
-## 5. 换机器时最容易踩的三件事
+## 6 卸载 / 回滚
 
-1. **Python 不止一个。** `python` 指向的可能不是装了 pillow/pywin32 的那个；
-   用 `DSH_CU_PYTHON` 钉死绝对路径，或先在 `doctor` 里看清它探测到了谁。
-2. **Chrome 136+ 的默认 profile 开不了调试端口。** `browser_use` 看的是独立 user-data-dir 的实例，
-   你日常那个已登录的 Chrome **不会**被接管——需要登录态的站，要么在调试实例里重登，
-   要么换 `huashu-chrome` 那类"驱动用户真实 Chrome"的方案。
-3. **命名管道被安全软件拦。** 症状是 `server_status` 连不上但进程活着；
-   设 `DSH_CU_TRANSPORT=tcp` + `DSH_CU_PORT=9xxx` 可绕过。
+1. `plugin_manager { "action": "remove_bundle", "target": "@local/dsh-computer-use" }`
+2. `powershell -ExecutionPolicy Bypass -File <插件目录>\scripts\rollback.ps1 -OldSkillsBackup <备份目录>`
+   —— 回收残留进程、松开 latch 的修饰键、删运行目录与截图缓存，并打印恢复旧技能的命令
+3. 旧技能目录：升级前的备份在 `~/.dsh/backups/iter6-computer-use-<时间戳>/`，
+   需要的话拷回 `~/.dsh/skills/computer-use/`
+4. 检查 `~/.dsh/profiles/<profile>/cordis.patch.yml` 是否残留
+   `- id: computer-use` 的覆盖项，有就删掉（切换插件开关时 plugin_manager 会追加）
 
 ---
 
-## 6. 文件清单
+## 7 已知边界（不假装做到）
+
+- **内部虚拟桌面 COM 多数机器拿不到**（本机实测 `REGDB_E_CLASSNOTREG`）：
+  `desktop_list` 会如实返回 `available:false`；切换用 `--direction left|right`（热键路径）。
+  `desktop_create/remove` 不会代替你按热键。
+- **`target:"pip"` 永远不支持**：那是豆包沙箱的 PiP 会话桌面概念，本机没有。
+- **Chrome 136+ 拒绝在默认 profile 上开调试端口**：`browser_use{action:"launch"}` 与
+  `scripts/chrome-debug.cmd` 都用独立 `--user-data-dir`；同一个 chrome 实例**看不到**
+  你原来登录态里的标签页（需要登录的站点要重新登）。
+- **`resync()` 判不出"屏幕上可见的标签页"**：CDP 没这个 API；能唯一确定才返回，
+  否则抛 `BU_SESSION_STALE` 让你用 `listTabs()+switchTab()`。
+- **`eval` 的线程杀不掉**：超时只返回错误，真挂住用 `server_restart` 回收服务。
+- **UIA 元素层在自绘界面上不可用**（无树可读）：退回 `shot` 看图路线。
+- **截图是双后端**：窗口截图走 `PrintWindow(PW_RENDERFULLCONTENT)`——**被别的窗口盖住也能截**、
+  不抢前台，并用 DWM 可见边界裁掉 Win11 的隐形边框；全屏走 GDI（Pillow/ImageGrab）。
+  PrintWindow 拿不到的重绘型窗口会自动退回屏幕裁剪并做遮挡检测（`CU_COVERED`）。
+  **没上 WGC**：`Windows.Graphics.Capture` 要 WinRT+D3D11 互操作，ctypes 下极易
+  access violation；PrintWindow 已达成同样的"截遮挡窗口 + 不抢前台"效果。
+
+---
+
+## 8 文件清单
 
 | 文件/目录 | 作用 |
 |---|---|
 | `package.json` | 包清单：`dsh.bundle.patch` + `files` 白名单 |
 | `cordis.patch.yml` | 一条 `insert`，把插件挂进 profile 条目树 |
-| `index.js` | Host 半：注册工具与技能、拉起/回收常驻服务 |
-| `lib/pipe-client.mjs` | Node ↔ Python 分帧协议、请求串行、不重发、超时 |
-| `lib/server-manager.mjs` | 解释器解析、拉起、探测复用、崩溃自愈 |
-| `lib/computer-use.mjs` / `lib/browser-use.mjs` | 两个工具的参数整形与结果渲染 |
-| `lib/cdp/**` | 纯 CDP 浏览器平面（零依赖，自带 selftest） |
-| `python/cu.py` | 内核 CLI（校验/审计/PNG 三重校验/元素层/虚拟桌面/doctor） |
-| `python/cu_server.py` | 常驻服务（传输/分帧/单实例/batch/eval/信封校验） |
-| `python/uia*` | UIA 元素层（常驻 PowerShell 行协议） |
-| `python/desktop.py` / `shadow.py` | 虚拟桌面与隔离桌面 |
-| `skills/**` | 随包下发的技能文本 |
-| `scripts/**` | `pack.ps1` / `install-profile.ps1` / `chrome-debug.cmd` / `rollback.ps1` |
-| `tests/**` | 契约测试（`python tests/run_all.py`） |
+| `index.js` | Host 半：注册两个工具 + 自带技能、拉起/回收常驻服务、占 provider 槽 |
+| `lib/pipe-client.mjs` | Node ↔ Python 分帧协议、请求串行、**不重发**、超时 |
+| `lib/server-manager.mjs` | 解释器解析、拉起、探测复用、崩溃自愈、优雅停止 |
+| `lib/computer-use.mjs` | `computer_use` 工具：action→argv、status 分类、`[next]` 提示、图片块渲染 |
+| `lib/browser-use.mjs` | `browser_use` 工具：包 `lib/cdp` |
+| `lib/cdp/**` | 纯 CDP 浏览器平面（零依赖，`node lib/cdp/selftest.mjs` 自测 47 项） |
+| `python/cu.py` | 内核 CLI（v2：校验/审计/PNG 三重校验/元素层/虚拟桌面/doctor） |
+| `python/cu_server.py` | 常驻服务（传输层/分帧/单实例/batch/eval/信封校验） |
+| `python/uia_sidecar.ps1` + `python/uia.py` | UIA 元素层（常驻 PowerShell 行协议） |
+| `python/desktop.py` | Windows 虚拟桌面（公共 COM / 内部 COM / 热键三档） |
+| `skills/computer-use/` | 自带技能（SKILL.md ≤5KB + `references/full-manual.md`） |
+| `skills/browser-use/` | 浏览器平面技能 |
+| `skills/im-chat/` | 社媒场景技能（随包分发的副本，不注册） |
+| `tests/` | 契约测试（`python tests/run_all.py` 一键全跑） |
+| `scripts/` | `pack.ps1` 打包、`chrome-debug.cmd` 起调试 Chrome、`rollback.ps1` 回滚 |

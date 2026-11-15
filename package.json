@@ -15,11 +15,10 @@
     "skills/**",
     "scripts/**",
     "tests/**",
-    "docs/**",
     "cordis.patch.yml",
-    "README.md",
     "INSTALL.md",
-    "LICENSE"
+    "AGENT-INSTALL.md",
+    "交接备忘.md"
   ],
   "dsh": {
     "bundle": {
@@ -28,15 +27,5 @@
   },
   "engines": {
     "node": ">=22"
-  },
-  "license": "MIT",
-  "keywords": [
-    "deepseek-harness",
-    "dsh",
-    "computer-use",
-    "browser-use",
-    "cdp",
-    "uia",
-    "windows"
-  ]
+  }
 }

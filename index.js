@@ -13,11 +13,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 
 import { ServerManager } from './lib/server-manager.mjs'
 import { createComputerUseTool } from './lib/computer-use.mjs'
 import { createBrowserUseTool } from './lib/browser-use.mjs'
-import { ensureShadow, stopShadow, shadowStatus, defaultDesktop, SHADOW_ENDPOINT } from './lib/shadow-session.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const SKILLS_DIR = path.join(HERE, 'skills')
@@ -95,39 +95,12 @@ export function apply(ctx, config = {}) {
 
   const manager = new ServerManager({ log })
   const attachments = ctx.attachments
-
-  // 隔离会话（shadow desktop）：桌面:'shadow' 时把调用改投到一个**独立桌面**上的
-  // cu_server。它不抢用户的鼠标（真 SendInput 在非输入桌面上被系统拒绝），
-  // 元素级/截图/剪贴板/凝视照常。懒创建：只有真用到才起进程。
-  let shadowMgr = null
-  const shadow = {
-    defaultDesktop,
-    async getManager() {
-      if (!shadowMgr) {
-        await ensureShadow()                       // 确保 python 侧会话在跑
-        shadowMgr = new ServerManager({
-          log,
-          env: {
-            ...process.env,
-            DSH_CU_TRANSPORT: 'named_pipe',
-            DSH_CU_ENDPOINT: SHADOW_ENDPOINT,
-          },
-        })
-      }
-      return shadowMgr
-    },
-    ensure: ensureShadow,
-    stop: async () => {
-      const r = await stopShadow()
-      shadowMgr = null
-      return r
-    },
-    status: shadowStatus,
-  }
+  // sessions 只用来把"是哪个会话在操作"写上横幅（Agent 本身只有 id，没有目录）。
+  const sessions = ctx.get ? ctx.get('sessions') : undefined
 
   // 工具注册：任一失败都只记日志，绝不抛——插件加载失败会拖垮整个 profile。
   try {
-    ctx.tools.register(createComputerUseTool({ manager, attachments, shadow }))
+    ctx.tools.register(createComputerUseTool({ manager, attachments, sessions }))
     log('[cu] 已注册 computer_use')
   } catch (e) {
     log(`[cu] 注册 computer_use 失败：${e.stack || e.message}`)
@@ -151,6 +124,109 @@ export function apply(ctx, config = {}) {
       () => log('[cu] 常驻服务就绪'),
       (e) => log(`[cu] 常驻服务没能起来（不阻塞插件加载）：${e.message}`),
     )
+  }
+
+  // 控制权跨回合：允许，但**不许在还握着控制权的时候把回合放下不管**。
+  //
+  // 用户的硬要求（2026-11-15）：cu 还在运行、DSH 还没被交还到前台之前，
+  // 这一轮不许就这么结束——否则控制权空挂、用户下一条指令模型也收不到。
+  // `agent/turn-stopping` 是 serial 事件、否决不了回合，所以这里做的是"回合刚停就把它
+  // 拽回来"：立刻给同一个会话 followup 一条提示，让它继续挂着（hold）或收尾。
+  // 它不替模型关 cu，也不抢执行权，只保证"cu 开着 ⟹ 会话不会静默睡下去"。
+  const TURN_NUDGE = [
+    '【控制权还在你手里】cu 仍开着，所以这一轮不能就这么结束。',
+    '现在做两件事之一：',
+    '1) 还要继续操作：调 computer_use action="hold" 等用户的话（每轮最多 55 秒，超时就再调一次），',
+    '   用户一说话就会带着原话返回；',
+    '2) 已经干完：调 action="deactivate" 交还并把 cu 关掉，再结束回合。',
+    '不要沉默地把回合结束掉——用户下一条指令会丢。',
+  ].join('\n')
+  if (typeof ctx.on === 'function') {
+    let lastNudge = 0
+    ctx.on('agent/turn-stopping', async ({ agent } = {}) => {
+      try {
+        if (!agent?.id) return
+        // 拽回来也要有节奏：模型硬是不听话时，20 秒内只拽一次，别把会话刷屏。
+        if (Date.now() - lastNudge < 20000) return
+        const alive = await manager.probe(300)
+        if (!alive) return
+        const res = await manager.call('control', {}, { timeoutMs: 3000 })
+        const c = res?.json?.value?.control
+        if (!c?.active || c.emergency) return
+        if (String(c.owner || '') !== String(agent.id)) return
+        // 有留言没送出去时别插话：轮询线程会用用户原话把它叫醒，比这条模板更准。
+        const q = await manager.call('messages', {}, { timeoutMs: 3000 })
+        if ((q?.json?.value?.items || []).length) return
+        if (typeof agent.followup === 'function') {
+          lastNudge = Date.now()
+          agent.followup({
+            id: randomUUID(),
+            role: 'user',
+            content: [{ type: 'text', text: TURN_NUDGE }],
+            source: { kind: 'user' },
+          })
+          log('[cu] 回合结束时控制权还在手里，已把会话拽回来继续挂着')
+        }
+      } catch (e) {
+        log(`[cu] 回合守卫失败（不影响收尾）：${e.message}`)
+      }
+    })
+  }
+
+  // ---- 留言唤醒 ----
+  //
+  // 用户点鲸鱼留的话，如果只挂在"下一次工具结果"里，那么会话一旦答完话睡着、
+  // 再也不调用工具，留言就永远到不了模型面前（2026-11-15 实测：用户连发三条，
+  // 模型一条都没看见）。所以这里另开一条路：轮询服务端的留言队列，拿到后用
+  // `agent.followup()` 直接叫醒那个会话——followup 会开一个新回合，留言就是
+  // 用户消息本身。
+  const agents = ctx.get ? ctx.get('agents') : undefined
+  if (agents && typeof agents.get === 'function') {
+    let relaying = false
+    const relay = async () => {
+      if (relaying) return
+      relaying = true
+      try {
+        const ping = await manager.probe(200)
+        if (!ping) return
+        const res = await manager.call('messages', {}, { timeoutMs: 3000 })
+        const items = res?.json?.value?.items || []
+        if (!items.length) return
+        const done = []
+        for (const item of items) {
+          const owner = String(item.owner || '')
+          const agent = owner ? agents.get(owner) : undefined
+          // 会话还活着才叫得醒；叫不醒就先留着（用户可能只是把标签页关了，
+          // 等他重新打开这个会话，下一次轮询还能送进去）。超过 10 分钟就不再等。
+          if (!agent || typeof agent.followup !== 'function') {
+            if (Date.now() / 1000 - Number(item.at || 0) > 600) done.push(item.id)
+            continue
+          }
+          try {
+            agent.followup({
+              id: randomUUID(),
+              role: 'user',
+              content: [{ type: 'text', text: `【用户在电脑控制期间的留言】${String(item.text || '')}` }],
+              source: { kind: 'user' },
+            })
+            done.push(item.id)
+            log(`[cu] 已把留言送进会话 ${owner}`)
+          } catch (e) {
+            log(`[cu] 唤醒会话 ${owner} 失败：${e.message}`)
+          }
+        }
+        if (done.length) await manager.call('messages', { ack: done }, { timeoutMs: 3000 })
+      } catch (e) {
+        log(`[cu] 留言轮询失败：${e.message}`)
+      } finally {
+        relaying = false
+      }
+    }
+    const timer = setInterval(() => { relay().catch(() => {}) }, 1200)
+    if (typeof timer.unref === 'function') timer.unref()
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(() => () => clearInterval(timer))
+    }
   }
 
   // 收尾：只停自己拉起的那个；复用别人的绝不杀。

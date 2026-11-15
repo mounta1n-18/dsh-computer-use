@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """cu.py 的契约测试（不靠"数数量"，只钉行为语义）。
 
 跑：`python tests/test_contracts.py`
@@ -128,7 +128,8 @@ def main():
                  "CU_BAD_ARG", "CU_NO_WINDOW", "CU_SCROLL_DELTA", "CU_BAD_HOTKEY",
                  "CU_WAIT_SECONDS", "CU_ELEMENT", "CU_NO_SIDECAR", "CU_IPC",
                  "CU_PROTOCOL", "CU_EVAL", "CU_EVAL_TIMEOUT",
-                 "CU_VDESKTOP_UNAVAILABLE", "CU_VDESKTOP_UNSUPPORTED"):
+                 "CU_NOT_ACTIVATED", "CU_LEASE_EXPIRED", "CU_BUSY",
+                 "CU_EMERGENCY_STOP", "CU_ACTIVATION_DENIED"):
         check("码表含 %s" % code, code in cu.CODES)
     spy = Spy()
     spy.install()
@@ -207,7 +208,7 @@ def main():
         spy.clear()
         cu.key_hold("shift", True)
         held = sorted(cu._HELD)
-        done = cu.release_all(force=True)
+        done = cu.release_all()
         check("key_hold 后 release_all 真的松开", held == ["shift"] and "shift" in done,
               {"held": held, "done": done})
         check("release_all 后 latch 清空", not cu._HELD and not cu._PRESSED_MODS)

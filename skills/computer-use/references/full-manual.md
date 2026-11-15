@@ -41,8 +41,8 @@ description: 用鼠标键盘自主操控 Windows 桌面——截屏、点击、�
 实测：一轮 T1 的 10 步里有 4 步浪费在探索 CLI 上。
 
 **看一眼只花一个来回**：截图写死 --out 路径，读图放在**同一条消息**里：
-    pwsh:       python "<插件目录>\python\cu.py" shot --out %TEMP%\cu\cur.png
-    read_image: %TEMP%\cu\cur.png
+    pwsh:       python "$HOME\.dsh\skills\computer-use\scripts\cu.py" shot --out C:\Users\ROSE\AppData\Local\Temp\cu\cur.png
+    read_image: C:\Users\ROSE\AppData\Local\Temp\cu\cur.png
 同一次助手消息里的两个工具调用按「先写后读」执行，所以一个来回就能看到画面。
 「先截一张、再单独调 read_image」是两次模型往返——一次观察白花一倍时间，这是最贵的浪费。
 要并排看第二张图（前后对比）时，第二次换 --out 的新文件名，两张一起读。
@@ -72,21 +72,23 @@ description: 用鼠标键盘自主操控 Windows 桌面——截屏、点击、�
 你会把自己正盯着的画面弄丢。**DSH 没有推送工具**，所以等待期间不要抢焦点去汇报：
 把话留到 `job_output` 返回（job 结算会主动唤醒你）或本轮结束时一起说。
 
-## 开工前：先拿到用户同意，再碰键鼠
+## 开工前：先 activate 拿到控制权，做完 deactivate
 
-**默认必须先问**。除非用户这次就是明确让你操控键鼠（他主动要求的），否则动手前走 `ask_user_question`：
+不再靠提示词自觉——服务端有闸：会动键鼠的动作没激活一律返回 `CU_NOT_ACTIVATED`。
 
-> 接下来我要接管鼠标键盘（预计 **N 分钟**），期间请不要碰鼠标键盘。
-> 中途可能需要你扫码或输密码，到时会切回终端叫你。现在方便吗？
+1. `activate{label:"<你是谁，例如 主 agent>"}`：屏幕边缘亮琥珀色，顶部弹横幅征求同意，
+   30 秒无回应按"同意"处理。这就是"问用户"，不要再单独写一段话去问。
+2. 一次激活做完整任务。用户中途碰键鼠多半是在帮你（点弹窗、扫码）：看到"用户正在操作"的
+   提示就停手观察，等他停手再继续，别抢回控制。
+3. 做完**必须** `deactivate{reason:"..."}`，并跟用户说一句"已交还，你可以正常操作了"。
+   交还后边缘光/光标圆/右下鲸鱼全部消失，用户看不到特效就表示可以接管。
+4. 手动关闭 `Ctrl+Alt+Shift+Backspace`：之后所有动作返回 `CU_EMERGENCY_STOP`，停手等用户恢复；
+   再按一次解除手动关闭，但不自动恢复控制权，要用得重新 activate。
+5. 暂停 `Ctrl+Shift+Alt`：动作返回 `CU_PAUSED`，租约保留，别重试也别抢回，等用户恢复或回话。
+6. 屏幕右下角鲸鱼图标：用户点它给你留言（期间自动暂停），留言以 `[提示]` 附在下一次结果里。
+7. `control` 查当前持有者、是否暂停、剩余空闲/上限时间、提示层与热键状态。
 
-选项给足三条：**现在可以，开始吧 / 我还在用，稍后 / 你先做完再叫我**。
-
-- 拿到"可以"再动手；选了后两项就**停下等**，别自作主张开始。
-- **时长要给出具体数字**（按步数粗估，如"约 3–5 分钟"），别只说"一会儿"。
-- 这一步不能省。接管键鼠会让用户正在做的事全部中断——不打招呼就拿走，跟抢方向盘没区别。
-
-动手后说一句"已接管，请勿触碰"，视觉路线依赖屏幕静止。
-
+只读动作（shot/windows/apps/find/wait/state_capture 等）不需要激活，随时可看。
 ## 坐标一律 0-1000（`--region` 是唯一例外）
 
 `(0,0)` 左上，`(1000,1000)` 右下，`(500,500)` 正中。按"目标占屏幕宽高的比例"估，支持小数。填像素会被拒。
@@ -533,35 +535,15 @@ element e12 --click           # 最后手段：算中心点走真鼠标
   **不会**把服务挂死。
 - UIA 调用在目标进程忙时会长时间阻塞（不可中断），所以预算与超时是硬要求，不是优化。
 
-## A4 Windows 虚拟桌面
+## A4 Windows 虚拟桌面（已取下）
 
-对齐的是"Windows 自带虚拟桌面（Win+Tab 那个）"。**注意**：豆包的
-`switch_desktop('main'|'pip')` 不是它——`pip` 是豆包自己沙箱的 PiP 会话桌面，
-本机没有对应概念，所以 `target:"pip"` 一律 `CU_VDESKTOP_UNSUPPORTED`，不瞎映射。
+2026-10-27 起，python/desktop.py 与 desktop-* 子命令整体移除（功能重做中），
+computer_use 工具里也不再暴露 desktop_list/current/switch/create/remove。
+**不要**调用这些动作名——它们不在动作表里，会被当作非法参数拒绝。
 
-| path | 能做什么 | 真实性 |
-|---|---|---|
-| `com_public` | `desktop_current`（前台窗口所在桌面 GUID） | 稳，`IVirtualDesktopManager` |
-| `com_internal` | 列表 / 按序号切 / 新建 / 关闭 | **多数机器拿不到** |
-| `hotkey` | 按方向切（`Win+Ctrl+←/→`） | 稳，最推荐 |
-| `unsupported` | 明确说做不到 + 手动办法 | 诚实兜底 |
-
-**本机实测**：`ImmersiveShell` / `VirtualDesktopManagerInternal` 全部
-`0x80040154 (REGDB_E_CLASSNOTREG)`、IID 全部 `E_NOINTERFACE`；公共 COM 可用；
-热键可用（用 DWM `cloaked` 属性验证）。所以这台机器上：
-
-- `desktop_current` → 真实 GUID ✔
-- `desktop_switch{direction:"left|right"}` → 热键路径 ✔
-- `desktop_list` → `available:false`（**不编造列表**）
-- `desktop_create/remove` → `CU_VDESKTOP_UNSUPPORTED` + 手动办法（**不代替你按热键**）
-
-**安全护栏**：内部 COM 拿到接口后先做校验调用（`GetCount()` 必须是 1..64 整数、
-`GetDesktop(0)` 必须 data1≠0）；校验不过或异常 → **本进程内永久禁用**内部 COM，
-回落热键。绝不在未校验的 vtable 偏移上调用——那是会崩的。
-
-可选 `desktop_list{discover:true}` 按方向走一圈、用 GUID 去重反推数量，走完回到原位；
-默认关闭（会短暂切屏）。
-
+要切虚拟桌面，目前只能请用户自己按 `Win+Ctrl+←/→`，或者由用户手动切到目标桌面后再继续。
+历史上的三档实现（公共 COM / 内部 COM / 热键）与安全护栏记录见交付报告，
+等重做完成后再回到本手册。
 ## A5 环境自检与安装引导
 
 - `cu.py doctor` / `computer_use{action:"doctor"}`：逐项检查解释器、pillow、pywin32、
@@ -588,8 +570,10 @@ element e12 --click           # 最后手段：算中心点走真鼠标
 
 新增错误码：`CU_SCROLL_DELTA`、`CU_BAD_HOTKEY`、`CU_WAIT_SECONDS`、`CU_NO_PYTHON`、
 `CU_IPC`、`CU_PROTOCOL`、`CU_EVAL`、`CU_EVAL_TIMEOUT`、`CU_AUDIT`、`CU_ELEMENT`、
-`CU_NO_SIDECAR`、`CU_DEP_MISSING`、`CU_VDESKTOP_UNAVAILABLE`、
-`CU_VDESKTOP_UNSUPPORTED`、`CU_VDESKTOP_PARTIAL`。
+`CU_NO_SIDECAR`、`CU_DEP_MISSING`。
+
+控制权相关错误码：`CU_NOT_ACTIVATED`、`CU_LEASE_EXPIRED`、`CU_BUSY`、
+`CU_EMERGENCY_STOP`、`CU_ACTIVATION_DENIED`。
 
 ## A7 顺手对齐的输入校验（来自豆包 `_validation.py`）
 
@@ -603,4 +587,5 @@ element e12 --click           # 最后手段：算中心点走真鼠标
   （本实现上限 600s，比豆包 180s 宽；更久的等待该交给后台 job）。
 - 截图做 **PNG 三重校验**：签名 + `IHDR`(长度 13) + `IEND` + PNG 自身宽高必须与声明一致。
   坏图直接 `CU_SHOT_FAIL`——模型不会说"这图是坏的"，它会照着半张图推理。
+
 

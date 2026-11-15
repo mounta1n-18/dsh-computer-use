@@ -1,0 +1,7 @@
+# 发布包里不该有的东西（npm pack 会按 package.json 的 files 白名单收集，
+# 但白名单目录内部的这些仍然会被带上，所以在这里排除）。
+__pycache__/
+*.pyc
+*.pyo
+*.tgz
+.DS_Store

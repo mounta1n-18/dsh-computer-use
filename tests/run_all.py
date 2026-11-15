@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """跑完所有离线契约。任何一项 FAIL 就不许提交。
 
     python tests/run_all.py            # 默认：guard + 契约 + 常驻服务 + 虚拟桌面 + 插件端到端
@@ -27,8 +27,22 @@ CASES = [
     ("guard（cu.py 旧契约，零丢失）", [PY, os.path.join(HERE, "guard.py")]),
     ("contracts（坐标/校验/错误码/截图/修饰键/凝视）", [PY, os.path.join(HERE, "test_contracts.py")]),
     ("server（常驻服务 + 传输层）", [PY, os.path.join(HERE, "test_server.py")]),
-    ("desktop（虚拟桌面，打桩 + 真机报告）", [PY, os.path.join(HERE, "test_desktop.py")]),
+    ("control（激活状态机 / 租约 / 手动关闭 / 留言投递，独立端点）",
+     [PY, os.path.join(HERE, "test_control.py")]),
     ("plugin（插件端到端，stub ctx）", ["node", os.path.join(HERE, "plugin.test.mjs")]),
+    ("click（横幅按钮真机可点，默认 SKIP）", [PY, os.path.join(HERE, "test_click.py")]),
+    ("stop（交还/急停后 cu 彻底退出，不是退后台）", [PY, os.path.join(HERE, "test_stop.py")]),
+    ("lease-idle（待命时交互续期、空闲超时才收权）",
+     [PY, os.path.join(HERE, "test_lease_idle.py")]),
+    ("release-buttons（松手不许凭空发鼠标抬起，无窗口）",
+     [PY, os.path.join(HERE, "test_release_buttons.py")]),
+    ("overlay-art（环/状态字/卡片不贴边裁切）", [PY, os.path.join(HERE, "test_overlay_art.py")]),
+    ("visual-gate（没提示就不许控制：起不来拒绝、被杀自我收工）",
+     [PY, os.path.join(HERE, "test_visual_gate.py")]),
+    ("hold（挂着等指令、取走即清空、cu 关闭不留旧指令，无窗口）",
+     [PY, os.path.join(HERE, "test_hold.py")]),
+    ("ask（模型主动提问→暂停但存活→用户答完自动恢复，无窗口）",
+     [PY, os.path.join(HERE, "test_ask.py")]),
 ]
 
 OPTIONAL = [
