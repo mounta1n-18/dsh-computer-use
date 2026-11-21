@@ -13,11 +13,11 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { randomUUID } from 'node:crypto'
 
 import { ServerManager } from './lib/server-manager.mjs'
 import { createComputerUseTool } from './lib/computer-use.mjs'
 import { createBrowserUseTool } from './lib/browser-use.mjs'
+import { createThinkingTool } from './lib/thinking.mjs'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const SKILLS_DIR = path.join(HERE, 'skills')
@@ -97,13 +97,32 @@ export function apply(ctx, config = {}) {
   const attachments = ctx.attachments
   // sessions 只用来把"是哪个会话在操作"写上横幅（Agent 本身只有 id，没有目录）。
   const sessions = ctx.get ? ctx.get('sessions') : undefined
+  // 会话在界面里显示的名字（用户可改名）；同意弹窗与横幅优先显示它。
+  const sessionTitle = ctx.get ? ctx.get('sessionTitle') : undefined
+
+  // 自适应思考：cu 接管期间默认关思维链，交还恢复；模型可用 thinking_control 自行调档。
+  const adaptive = config?.adaptiveThinking !== false
 
   // 工具注册：任一失败都只记日志，绝不抛——插件加载失败会拖垮整个 profile。
   try {
-    ctx.tools.register(createComputerUseTool({ manager, attachments, sessions }))
+    ctx.tools.register(createComputerUseTool({ manager, attachments, sessions, sessionTitle, adaptive }))
     log('[cu] 已注册 computer_use')
   } catch (e) {
     log(`[cu] 注册 computer_use 失败：${e.stack || e.message}`)
+  }
+  try {
+    const thinking = createThinkingTool({
+      enabled: adaptive,
+      onLabel: (label) => {
+        try { manager.call('phase', { label }, { timeoutMs: 1500 }).catch(() => {}) } catch {}
+      },
+    })
+    if (thinking) {
+      ctx.tools.register(thinking)
+      log('[cu] 已注册 thinking_control（自适应思考）')
+    }
+  } catch (e) {
+    log(`[cu] 注册 thinking_control 失败：${e.stack || e.message}`)
   }
   try {
     ctx.tools.register(createBrowserUseTool({ attachments, log }))
@@ -126,108 +145,74 @@ export function apply(ctx, config = {}) {
     )
   }
 
-  // 控制权跨回合：允许，但**不许在还握着控制权的时候把回合放下不管**。
+  // 退回合闸门（用户 2026-11-20 的硬要求，第三次返工后定稿）：
   //
-  // 用户的硬要求（2026-11-15）：cu 还在运行、DSH 还没被交还到前台之前，
-  // 这一轮不许就这么结束——否则控制权空挂、用户下一条指令模型也收不到。
-  // `agent/turn-stopping` 是 serial 事件、否决不了回合，所以这里做的是"回合刚停就把它
-  // 拽回来"：立刻给同一个会话 followup 一条提示，让它继续挂着（hold）或收尾。
-  // 它不替模型关 cu，也不抢执行权，只保证"cu 开着 ⟹ 会话不会静默睡下去"。
-  const TURN_NUDGE = [
-    '【控制权还在你手里】cu 仍开着，所以这一轮不能就这么结束。',
-    '现在做两件事之一：',
-    '1) 还要继续操作：调 computer_use action="hold" 等用户的话（每轮最多 55 秒，超时就再调一次），',
-    '   用户一说话就会带着原话返回；',
-    '2) 已经干完：调 action="deactivate" 交还并把 cu 关掉，再结束回合。',
-    '不要沉默地把回合结束掉——用户下一条指令会丢。',
-  ].join('\n')
+  //   只在 cu 还开着的时候拦，平时一根手指都不碰。
+  //   cu 没关就不许结束回合——不是替模型关（那是作弊），而是**把它拽回来**：
+  //   往它的 next-step 队列里塞一条指令，让主循环再跑一步，逼它自己 deactivate。
+  //
+  // DSH 的官方口径：turn-stopping 的返回值/异常都不算"反对"，唯一的开关是
+  // 监听器里调 agent.steer(...) 往 inbox 塞数据；塞完 `inbox.nextStep.length > 0`，
+  // 循环就不会 break（`dsh-agent-loop/lib/index.js:803-811`）。
+  //
+  // 消息不冒充用户：source.kind 用自定义的 'cu-gate'，客户端把它渲染成折叠的
+  // "上下文注入"行（`dsh-client-ui-chat/.../message.ts:96` 判 kind !== 'user'），
+  // 不进聊天气泡，也不会像以前那样让模型在用户面前自说自话。
+  const gateAttempts = new Map()
+  const GATE_MAX_TRIES = 4
+
   if (typeof ctx.on === 'function') {
-    let lastNudge = 0
-    ctx.on('agent/turn-stopping', async ({ agent } = {}) => {
+    ctx.on('agent/turn-stopping', async ({ agent, turn } = {}) => {
       try {
         if (!agent?.id) return
-        // 拽回来也要有节奏：模型硬是不听话时，20 秒内只拽一次，别把会话刷屏。
-        if (Date.now() - lastNudge < 20000) return
         const alive = await manager.probe(300)
         if (!alive) return
         const res = await manager.call('control', {}, { timeoutMs: 3000 })
         const c = res?.json?.value?.control
-        if (!c?.active || c.emergency) return
+        // 没租约 = 没在用 cu：正常收尾，什么都不做。
+        if (!c?.active) return
         if (String(c.owner || '') !== String(agent.id)) return
-        // 有留言没送出去时别插话：轮询线程会用用户原话把它叫醒，比这条模板更准。
-        const q = await manager.call('messages', {}, { timeoutMs: 3000 })
-        if ((q?.json?.value?.items || []).length) return
-        if (typeof agent.followup === 'function') {
-          lastNudge = Date.now()
-          agent.followup({
-            id: randomUUID(),
-            role: 'user',
-            content: [{ type: 'text', text: TURN_NUDGE }],
-            source: { kind: 'user' },
-          })
-          log('[cu] 回合结束时控制权还在手里，已把会话拽回来继续挂着')
+
+        const key = `${agent.id}:${turn}`
+        const n = gateAttempts.get(key) || 0
+        if (n >= GATE_MAX_TRIES) {
+          log(`[cu] 退回合闸门：同一回合已拦 ${n} 次，放弃（cu 仍开着，用户看得见）`)
+          return
         }
+        gateAttempts.set(key, n + 1)
+
+        const text = '[cu 闸门] 你还握着这台电脑的控制权（cu 没关）。现在不能结束回合：'
+          + '先调 computer_use action="deactivate" 妥善收工（它会关提示层、把 DSH 切回前台），'
+          + '确认之后才能结束本轮。如果你只是想等用户说话，改调 action="hold"。'
+          + '不要用"结束回合"来甩掉控制权——用户会看不见模型是否还在用电脑。'
+        const message = {
+          id: globalThis.crypto?.randomUUID?.() || `cu-gate-${Date.now()}`,
+          role: 'user',
+          content: [{ type: 'text', text }],
+          source: { kind: 'cu-gate', form: 'notice', summary: 'cu 未关闭，回合被拦回' },
+        }
+        try {
+          agent.steer(message)
+        } catch (e) {
+          // 兜底：老版本 Agent 可能不接受外来的 source 种类，退回普通文本，
+          // 至少把模型拽回来（宁可多一行上下文，也不能让它把 cu 晾着）。
+          log(`[cu] 退回合闸门 steer 失败，改 inject：${e.message}`)
+          if (typeof agent.inject === 'function') agent.inject(text)
+          else if (typeof agent.steer === 'function') agent.steer(text)
+        }
+        log(`[cu] 退回合闸门：cu 仍开着，已把模型拽回下一步（第 ${n + 1} 次）`)
       } catch (e) {
-        log(`[cu] 回合守卫失败（不影响收尾）：${e.message}`)
+        log(`[cu] 退回合闸门失败（不影响收尾）：${e.message}`)
       }
     })
   }
 
-  // ---- 留言唤醒 ----
+  // ---- 留言送达：只走 hold 的工具结果 ----
   //
-  // 用户点鲸鱼留的话，如果只挂在"下一次工具结果"里，那么会话一旦答完话睡着、
-  // 再也不调用工具，留言就永远到不了模型面前（2026-11-15 实测：用户连发三条，
-  // 模型一条都没看见）。所以这里另开一条路：轮询服务端的留言队列，拿到后用
-  // `agent.followup()` 直接叫醒那个会话——followup 会开一个新回合，留言就是
-  // 用户消息本身。
-  const agents = ctx.get ? ctx.get('agents') : undefined
-  if (agents && typeof agents.get === 'function') {
-    let relaying = false
-    const relay = async () => {
-      if (relaying) return
-      relaying = true
-      try {
-        const ping = await manager.probe(200)
-        if (!ping) return
-        const res = await manager.call('messages', {}, { timeoutMs: 3000 })
-        const items = res?.json?.value?.items || []
-        if (!items.length) return
-        const done = []
-        for (const item of items) {
-          const owner = String(item.owner || '')
-          const agent = owner ? agents.get(owner) : undefined
-          // 会话还活着才叫得醒；叫不醒就先留着（用户可能只是把标签页关了，
-          // 等他重新打开这个会话，下一次轮询还能送进去）。超过 10 分钟就不再等。
-          if (!agent || typeof agent.followup !== 'function') {
-            if (Date.now() / 1000 - Number(item.at || 0) > 600) done.push(item.id)
-            continue
-          }
-          try {
-            agent.followup({
-              id: randomUUID(),
-              role: 'user',
-              content: [{ type: 'text', text: `【用户在电脑控制期间的留言】${String(item.text || '')}` }],
-              source: { kind: 'user' },
-            })
-            done.push(item.id)
-            log(`[cu] 已把留言送进会话 ${owner}`)
-          } catch (e) {
-            log(`[cu] 唤醒会话 ${owner} 失败：${e.message}`)
-          }
-        }
-        if (done.length) await manager.call('messages', { ack: done }, { timeoutMs: 3000 })
-      } catch (e) {
-        log(`[cu] 留言轮询失败：${e.message}`)
-      } finally {
-        relaying = false
-      }
-    }
-    const timer = setInterval(() => { relay().catch(() => {}) }, 1200)
-    if (typeof timer.unref === 'function') timer.unref()
-    if (typeof ctx.effect === 'function') {
-      ctx.effect(() => () => clearInterval(timer))
-    }
-  }
+  // 以前这里用 agent.followup 把留言直接塞进会话，好处是睡着了也能叫醒；
+  // 但那会在对话界面留下一条用户消息（用户 2026-11-20 明确禁止：提示词只能在
+  // 后台轨迹里）。现在留言只挂在服务端队列里，等模型下一次 hold 时随工具结果带回，
+  // 轨迹里可见、对话里不可见。relay（鲸鱼环颜色）全在 Python 侧维护。
 
   // 收尾：只停自己拉起的那个；复用别人的绝不杀。
   const cleanup = async () => {

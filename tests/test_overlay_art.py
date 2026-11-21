@@ -58,6 +58,60 @@ def main():
     else:
         print("PASS 横幅四边透明（%dx%d）" % img.size)
 
+    # 急停闪烁：包络必须是"平滑呼吸三下"，不是频闪。
+    r = overlay.Renderer.__new__(overlay.Renderer)
+    r.flash_t0 = 100.0
+    r.flash_n = 3
+    r.flash_color = overlay.RED
+    ks = [r._flash_env(100.0 + i * 0.05)[1] for i in range(0, 27)]
+    flash_ok = True
+    if ks[0] > 0.3:
+        flash_ok = False
+        print("FAIL 闪烁起始不是从暗处升起：k=%.2f" % ks[0])
+    if max(ks) < 0.95:
+        flash_ok = False
+        print("FAIL 闪烁没到峰值：max=%.2f" % max(ks))
+    jumps = [abs(ks[i + 1] - ks[i]) for i in range(len(ks) - 1)]
+    if jumps and max(jumps) > 0.55:
+        flash_ok = False
+        print("FAIL 闪烁跳变过大（疑似频闪）：max jump=%.2f" % max(jumps))
+    if r._flash_env(100.0 + 0.42 * 3)[1] != 0.0:
+        flash_ok = False
+        print("FAIL 三下之后没有归零")
+    if flash_ok:
+        print("PASS 闪烁包络：平滑呼吸 3 下（起始 %.2f，峰值 %.2f，%.2fs 收尾）"
+              % (ks[0], max(ks), 0.42 * 3))
+    ok = ok and flash_ok
+
+    # 四角：竖条的角格 = max(横, 纵)，既不多一层也不切断；接缝两侧数值连续。
+    th = 60
+    imgs = overlay.frame_images(800, 600, th, overlay.STATUS_ACTIVE, 0.95)
+    left, right, top, bottom = imgs
+    la = left.split()[3]
+    ta = top.split()[3]
+    corner_ok = True
+    peak_val = la.getpixel((0, 0))
+    if peak_val < 240:
+        corner_ok = False
+        print("FAIL 角上没到峰值（被两窗叠暗？）：%d" % peak_val)
+    if la.getpixel((th - 1, 0)) != ta.getpixel((0, 0)):
+        corner_ok = False
+        print("FAIL 接缝不连续：竖条 %d vs 横条 %d"
+              % (la.getpixel((th - 1, 0)), ta.getpixel((0, 0))))
+    worst = max(la.getpixel((x, y)) for x in range(th) for y in (0, 1, 599 - 1))
+    if worst > 245:
+        corner_ok = False
+        print("FAIL 角上有叠加发白：max=%d" % worst)
+    # 沿上边缘走到角里，不该出现"先变暗再突然亮"的断点
+    row = [la.getpixel((x, 0)) for x in range(th)]
+    if min(row) < peak_val - 2:
+        corner_ok = False
+        print("FAIL 上边缘在角内出现下跌：min=%d peak=%d" % (min(row), peak_val))
+    if corner_ok:
+        print("PASS 四角 max 合成：无叠加、无断点（角格 %dx%d，接缝 %d→%d）"
+              % (th, th, la.getpixel((th - 1, 0)), ta.getpixel((0, 0))))
+    ok = ok and corner_ok
+
     print("RESULT:", "ALL PASS" if ok else "FAIL")
     return 0 if ok else 1
 

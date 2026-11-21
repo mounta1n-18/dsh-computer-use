@@ -20,6 +20,7 @@ ENV.update({
     "DSH_CU_CONSENT": "auto",
     "DSH_CU_TEST": "1",
     "DSH_CU_STAY_ALIVE": "1",   # 状态机测试要连续断言，别让交还/急停把服务关了
+    "DSH_CU_OVERLAY": "0",      # 不弹窗：这些用例只验状态机，别打扰正在用电脑的人
     "DSH_CU_IDLE_TTL": "120",
 })
 for k, v in ENV.items():
@@ -90,6 +91,11 @@ try:
 
     r = req("deactivate", reason="done")
     check("deactivate", r.get("ok") and r["value"]["deactivated"], r)
+    # 交还之后 hold 必须报出"为什么没了"，不能让模型拿激活文案里的空闲秒数当答案。
+    w = req("wait", seconds=1)["value"]
+    check("wait reports deactivate reason",
+          w.get("active") is False and w.get("reason") == "deactivate" and "交还" in w.get("detail", ""),
+          w.get("reason") or w)
     r = req("cmd", argv=["focus", "__no_such_window__"])
     check("action blocked after deactivate", r.get("code") == "CU_NOT_ACTIVATED", r)
 
@@ -98,6 +104,12 @@ try:
     check("reactivate", r.get("ok"), r.get("code"))
     r = req("control", action="trip")
     check("trip", r.get("ok") and r["value"]["control"]["emergency"], r)
+    # 用户按急停不是"闲置"：wait 必须报 emergency，detail 里也不能出现空闲字样。
+    w = req("wait", seconds=1)["value"]
+    check("wait reports emergency reason",
+          w.get("reason") == "emergency" and "急停" in w.get("detail", "")
+          and "空闲" not in w.get("detail", ""),
+          w.get("reason") or w)
     r = req("cmd", argv=["focus", "__no_such_window__"])
     check("action blocked on emergency", r.get("code") == "CU_EMERGENCY_STOP", r)
     r = req("activate", owner="agent-A")
@@ -120,6 +132,10 @@ try:
     req("ping", ack_notice=r.get("notice_ids"))
     r = req("control")
     check("notice cleared after ack", "这句话只用来验证投递" not in (r.get("notice") or ""), r.get("notice"))
+    # 回了话才能收工（2026-11-18 规则：待回复时 deactivate 会被 CU_UNANSWERED 挡）
+    r = req("deactivate", reason="before-reply")
+    check("deactivate blocked while pending", r.get("code") == "CU_UNANSWERED", r.get("code"))
+    req("reply", text="")
     # 空闲过期
     req("deactivate", reason="test-expiry")
     r = req("activate", owner="agent-A", idle_ttl=2)
@@ -154,15 +170,34 @@ try:
     r = req("cmd", argv=["focus", "__no_such_window__"])
     check("blocked while chatting", r.get("code") == "CU_PAUSED", r.get("code"))
     r = req("control", action="message", text="别点右键，用键盘")
-    check("message resumes", r.get("ok") and r["value"]["control"]["paused"] is False, r)
+    check("message keeps paused", r.get("ok") and r["value"]["control"]["paused"] is True, r)
     r = req("control")
     check("message reaches agent", "别点右键" in (r.get("notice") or ""), r.get("notice"))
     # 不 ack 就重发（至少一次投递）
     r2 = req("control")
     check("notice redelivered until ack", "别点右键" in (r2.get("notice") or ""), r2.get("notice"))
+    # 工具侧的话必须工具侧答：reply 之后才恢复
+    r = req("reply", text="好，只用键盘")
+    check("reply resumes", r.get("ok") and r["value"]["control"]["paused"] is False, r)
     req("ping", ack_notice=r2.get("notice_ids"))
     r3 = req("control")
     check("message cleared after ack", "别点右键" not in (r3.get("notice") or ""), r3.get("notice"))
+
+    # ---- 防积压：新一轮接管不许继承上一轮的留言/提示 ----
+    # （退回合闸门已改到 JS 侧 steer，Python 不再有 guard；这里只验服务端的清场）
+    req("deactivate", reason="prep-carryover")
+    r = req("activate", owner="agent-B")
+    check("carryover: activate", r.get("ok"), r.get("code"))
+    req("control", action="message", text="这句不能留到下一轮")
+    r = req("deactivate", reason="blocked-by-unanswered")
+    check("未回复不许收工", r.get("code") == "CU_UNANSWERED", r.get("code"))
+    req("reply", text="")
+    r = req("deactivate", reason="cleanup-carryover")
+    check("deactivate after reply", r.get("ok"), r.get("code"))
+    r = req("activate", owner="agent-C")
+    check("activate after carryover", r.get("ok"), r.get("code"))
+    c3 = req("control")["value"]
+    check("no carryover into next cu", not (c3.get("notice") or "").strip(), c3.get("notice"))
 
     # ---- 急停：解除后必须彻底静默（不激活、不弹提示） ----
     req("control", action="trip")

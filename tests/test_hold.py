@@ -84,6 +84,8 @@ def main():
     side.request("control", action="message", text="这条不许留到下一次")
     inbox = os.path.join(HOME, "inbox.json")
     check("留言已落盘", os.path.exists(inbox))
+    # 待回复时不许收工（2026-11-18 规则），先回一句空的再交还
+    c.request("reply", text="")
     c.request("deactivate", reason="test")
     for _ in range(80):
         if p.poll() is not None:

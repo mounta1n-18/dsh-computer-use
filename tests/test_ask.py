@@ -76,7 +76,18 @@ def main():
         check("暂停期间动作被 CU_PAUSED 拦", (r.get("code") == "CU_PAUSED"), str(r.get("code")))
 
         r, _ = c.request("control", action="message", text="密码是 1234")
-        check("用户回答后自动恢复", (r.get("value") or {}).get("control", {}).get("paused") is False)
+        ctl = (r.get("value") or {}).get("control", {})
+        # 2026-11-18 规则：用户说完话仍然暂停，agent 必须 reply 才能继续
+        check("用户回答后仍暂停（等 agent 回话）",
+              ctl.get("paused") is True and ctl.get("pending_reply") is True)
+
+        r, _ = c.request("cmd", argv=["focus", "__no_such_window__"])
+        check("回话前动作被 CU_UNANSWERED 拦",
+              r.get("code") == "CU_UNANSWERED", str(r.get("code")))
+
+        r, _ = c.request("reply", text="收到密码，继续")
+        check("reply 之后解除暂停",
+              (r.get("value") or {}).get("control", {}).get("paused") is False)
 
         r, _ = c.request("cmd", argv=["focus", "__no_such_window__"])
         check("恢复后动作放行（CU_NO_WINDOW 而非 CU_PAUSED）",
@@ -87,11 +98,14 @@ def main():
         r, _ = c.request("ask", text="再确认一次")
         c.request("control", action="logo_click")
         r2, _ = c.request("control")
-        check("再点鲸鱼等于恢复", r2["value"]["control"]["paused"] is False)
+        check("再点鲸鱼只开留言框、不解除暂停",
+              r2["value"]["control"]["paused"] is True)
 
         r, _ = c.request("ask", text="")
         check("缺 text 报 CU_BAD_ARG", r.get("code") == "CU_BAD_ARG", str(r.get("code")))
 
+        # 先确保处于"恢复"状态，再测暂停/恢复两条提示（前面点过鲸鱼，可能还暂停着）
+        c.request("resume")
         c.request("control", action="pause")
         r, _ = c.request("control")
         check("暂停时 agent 收到提示", "用户已暂停 cu" in (r.get("notice") or ""),

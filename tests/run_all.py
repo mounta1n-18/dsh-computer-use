@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """跑完所有离线契约。任何一项 FAIL 就不许提交。
 
     python tests/run_all.py            # 默认：guard + 契约 + 常驻服务 + 虚拟桌面 + 插件端到端
@@ -41,8 +41,10 @@ CASES = [
      [PY, os.path.join(HERE, "test_visual_gate.py")]),
     ("hold（挂着等指令、取走即清空、cu 关闭不留旧指令，无窗口）",
      [PY, os.path.join(HERE, "test_hold.py")]),
-    ("ask（模型主动提问→暂停但存活→用户答完自动恢复，无窗口）",
+    ("ask（模型主动提问→暂停但存活→用户答完仍等 reply，无窗口）",
      [PY, os.path.join(HERE, "test_ask.py")]),
+    ("reply-gate（工具侧的话必须工具侧答：空回复也算，未答不许动作/不收工，无窗口）",
+     [PY, os.path.join(HERE, "test_reply_gate.py")]),
 ]
 
 OPTIONAL = [

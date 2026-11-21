@@ -1,4 +1,4 @@
-﻿"""交还/急停之后 cu 必须**彻底退出**（不是退后台）。
+"""交还/急停之后 cu 必须**彻底退出**（不是退后台）。
 
 用户 2026-11-14 定的语义：
   急停 = 即停即止 → 红边 3 秒 + 告诉 agent → 整个服务关掉；
@@ -85,17 +85,14 @@ check("deactivate ok", r.get("ok") and r["value"]["deactivated"], r)
 check("deactivate 声明已关闭", r["value"].get("closed") is True, r["value"])
 check("交还后进程退出", wait_exit(p, 6), "进程还活着 pid=%s" % p.pid)
 marker = os.path.join(HOME, "last_stop.json")
-check("写了 last_stop.json", os.path.exists(marker), marker)
-if os.path.exists(marker):
-    m = json.load(open(marker, encoding="utf-8"))
-    check("标记原因是 deactivate", m.get("reason") == "deactivate", m)
+check("不再写 last_stop.json（新实例不继承旧账）", not os.path.exists(marker), marker)
 
-# ---- 2. 新实例：没有控制权，但会告诉 agent 上次是谁关的 ----
+# ---- 2. 新实例：没有控制权，也不许拿上一轮的"为什么关掉"来吓模型 ----
 p = start()
 r = req("control")
 st = r["value"]["control"]
 check("新实例未激活", st["active"] is False and st["emergency"] is False, st)
-check("新实例读到停机原因", "电脑控制已关闭" in (r.get("notice") or ""), r.get("notice"))
+check("新实例不继承停机提示", "电脑控制" not in (r.get("notice") or ""), r.get("notice"))
 
 # ---- 3. 急停 → 红边 3 秒 → 服务退出 ----
 r = req("activate", owner="agent-emg")
@@ -107,13 +104,12 @@ check("急停当场阻断", req("cmd", argv=["focus", "__no_such_window__"]).get
       == "CU_EMERGENCY_STOP")
 check("急停后 3 秒内还活着（让动画播完）", p.poll() is None)
 check("急停动画后进程退出", wait_exit(p, 8), "进程还活着")
-m = json.load(open(marker, encoding="utf-8"))
-check("标记原因是 emergency", m.get("reason") == "emergency", m)
+check("急停后也不留 last_stop.json", not os.path.exists(marker), marker)
 
-# ---- 4. 再起一个新实例，急停提示要送到 agent ----
+# ---- 4. 再起一个新实例：不许把上一次的急停当成这一次的"关闭" ----
 p = start()
 r = req("control")
-check("手动关闭提示送达", "手动关闭" in (r.get("notice") or ""), r.get("notice"))
+check("新实例不继承急停提示", "手动关闭" not in (r.get("notice") or ""), r.get("notice"))
 req("shutdown")
 time.sleep(0.5)
 

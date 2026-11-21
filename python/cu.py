@@ -105,6 +105,7 @@ CODES = {
     "CU_EMERGENCY_STOP": "用户手动关闭了电脑控制；不要重试或绕过，等用户明确恢复",
     "CU_ACTIVATION_DENIED": "用户拒绝了激活请求；不要立刻再弹一次，先问用户想怎么做",
     "CU_PAUSED": "用户按了暂停（Ctrl+Shift+Alt），正在等你回话或自己接手；不要重试，等用户恢复",
+    "CU_UNANSWERED": "用户从右下角递话框发了话，你还没回答：先用 action=\"reply\" 把你的回答写回去，然后才能继续操作电脑",
     "CU_NO_OVERLAY": "桌面提示层起不来（缺少 tkinter 或桌面不可用），激活被拒绝以防无提示地抢控制权",
 
 
@@ -141,6 +142,9 @@ class Control:
         self.pending = None          # 正在等用户同意的请求（仅服务端用）
         self.paused = False          # 用户按了暂停键：保留租约，但停止一切注入
         self.paused_at = 0.0
+        # 用户从工具侧（右下角递话框）发来一句话、agent 还没用 reply 回答时置 True。
+        # 这一层比 paused 更硬：paused 允许用户自己按回来，pending_reply 只允许 reply 解开。
+        self.pending_reply = False
         self.visual_check = None     # 服务端注入的可调用对象：提示层是否真的在屏上见
 
     def set_paused(self, on, reason=""):
@@ -175,6 +179,7 @@ class Control:
                 "pending": (self.pending or {}).get("owner"),
                 "paused": self.paused,
                 "paused_seconds": int(time.time() - self.paused_at) if self.paused else 0,
+                "pending_reply": self.pending_reply,
             }
 
     # ---- 闸门 ----
@@ -184,6 +189,10 @@ class Control:
             return
         if self.emergency:
             raise CuError("CU_EMERGENCY_STOP", "")
+        # 用户从工具侧问了话、agent 还没答：先答再干活。这条排在 paused 前面，
+        # 因为用户按暂停可以自己按回来，而"没回答用户"只能由 reply 解开。
+        if self.pending_reply:
+            raise CuError("CU_UNANSWERED", "")
         if self.paused:
             raise CuError("CU_PAUSED", "")
         # 只有"提示层确实在屏幕上"时才允许注入。这条是用户要求的硬等价：
@@ -222,11 +231,13 @@ class Control:
                           "max_deadline": now + self.max_ttl}
             self.emergency = False
             self.paused = False
+            self.pending_reply = False
             return dict(self.lease)
 
     def revoke(self, reason=""):
         with self._lock:
             self.paused = False
+            self.pending_reply = False
             L, self.lease = self.lease, None
             if L:
                 L = dict(L)
@@ -561,6 +572,48 @@ def move(x, y):
     _mouse(MOVE | ABS | VDESK, nx, ny)
 
 
+def _ease(t):
+    """三次缓入缓出：慢-快-慢。t∈[0,1]。"""
+    if t < 0.5:
+        return 4.0 * t * t * t
+    u = -2.0 * t + 2.0
+    return 1.0 - (u * u * u) / 2.0
+
+
+# 指针 glide 的节奏参数：短距离也要有过程（不能一帧到位），长距离封顶 320ms。
+GLIDE_MIN_MS = 80
+GLIDE_MAX_MS = 320
+GLIDE_PX_PER_MS = 0.85
+
+
+def _glide(x, y, ms=None):
+    """真实指针的平滑移动：三次缓动，逐帧 SetCursorPos/SendInput，不是播动画。
+
+    模型给的坐标仍是离散的，这里把"瞬移"变成一次真实的慢-快-慢位移；
+    调用方（click/drag/move）同步等它走完，所以对上层是黑箱。
+    返回实际用时（秒）。
+    """
+    x0, y0 = where()
+    dx, dy = x - x0, y - y0
+    dist = (dx * dx + dy * dy) ** 0.5
+    if dist < 2:
+        move(x, y)
+        return 0.0
+    if ms is None:
+        ms = int(max(GLIDE_MIN_MS, min(GLIDE_MAX_MS, 60 + dist * GLIDE_PX_PER_MS)))
+    dur = max(0.02, ms / 1000.0)
+    t0 = time.perf_counter()
+    while True:
+        t = (time.perf_counter() - t0) / dur
+        if t >= 1.0:
+            break
+        e = _ease(t)
+        move(int(round(x0 + dx * e)), int(round(y0 + dy * e)))
+        time.sleep(0.006)
+    move(x, y)
+    return time.perf_counter() - t0
+
+
 def _move_smooth(nx, ny, ms=300):
     """平滑移动光标（对齐豆包 mouse.move_smooth）。
 
@@ -576,7 +629,8 @@ def _move_smooth(nx, ny, ms=300):
     steps = 1 if ms <= 0 else max(2, min(60, dist // 12 or 2))
     pause = (ms / 1000.0) / steps if ms > 0 else 0
     for i in range(1, steps + 1):
-        move(int(x0 + (x1 - x0) * i / steps), int(y0 + (y1 - y0) * i / steps))
+        e = _ease(i / float(steps))
+        move(int(round(x0 + (x1 - x0) * e)), int(round(y0 + (y1 - y0) * e)))
         if pause:
             time.sleep(pause)
     return x1, y1
@@ -603,8 +657,8 @@ def wait_seconds(v, lo=0.0, hi=600.0):
 
 def click(nx, ny, right=False, double=False, triple=False):
     x, y = to_px(nx, ny)
-    move(x, y)
-    time.sleep(0.02)
+    _glide(x, y)
+    time.sleep(0.05)          # 落点停顿：hover 态/工具提示先到位，再按下
     down, up = (RDOWN, RUP) if right else (LDOWN, LUP)
     n = 3 if triple else (2 if double else 1)
     for i in range(n):
@@ -624,13 +678,14 @@ def drag(nx1, ny1, nx2, ny2, ms=800):
     x2, y2 = to_px(nx2, ny2)
     steps = max(10, min(60, int(ms / 20)))
     pause = (ms / 1000.0) / steps
-    move(x1, y1)
+    _glide(x1, y1)            # 先去起点：同样真平滑，不瞬移
     time.sleep(0.06)
     _mouse_down(LDOWN)
     try:
         time.sleep(0.06)
         for i in range(1, steps + 1):
-            move(int(x1 + (x2 - x1) * i / steps), int(y1 + (y2 - y1) * i / steps))
+            e = _ease(i / float(steps))
+            move(int(round(x1 + (x2 - x1) * e)), int(round(y1 + (y2 - y1) * e)))
             time.sleep(pause)
         time.sleep(0.08)      # 落点停顿：让目标应用确认悬停到位再松手
     finally:
@@ -1735,7 +1790,7 @@ def _validate_png(png, width=None, height=None):
     return pw, ph
 
 
-def capture_png(long_edge=1280, region=None):
+def capture_png(long_edge=1280, region=None, grid=True):
     """只抓图、不落盘。返回 (png_bytes, meta)。
 
     抽出来是为了让常驻服务能把 PNG 直接塞进图片帧（不落临时文件），
@@ -1755,7 +1810,7 @@ def capture_png(long_edge=1280, region=None):
                           "改用 shot --window <窗口名>（走 PrintWindow）。原始错误：%s"
                           % (e or type(e).__name__))
         raise CuError("CU_SHOT_FAIL", str(e) or type(e).__name__)
-    return _encode_png_img(img, long_edge, region, "gdi")
+    return _encode_png_img(img, long_edge, region, "gdi", grid=grid)
 
 
 # ---------------------------------------------------------------- PrintWindow 后端
@@ -1901,7 +1956,49 @@ def capture_window_png(hwnd):
             _RDC(hwnd, hwnd_dc)
 
 
-def _encode_png_img(img, long_edge, region=None, capture_path="gdi"):
+def _grid_overlay(img):
+    """在截图上打 0-1000 归一化网格，方便模型按刻度取坐标。
+
+    为什么需要：模型看到的图被缩到长边 1280，靠肉眼估"按钮在图的百分之几"
+    误差常常有 2-4%，在计算器这种按钮密集的界面上就是点空。网格把"读图"
+    变成"读刻度"，误差压到 1% 以内（=10 个归一化单位）。
+    """
+    from PIL import Image, ImageDraw, ImageFont
+    w, h = img.size
+    lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(lay)
+    try:
+        font = ImageFont.truetype(os.path.join(
+            os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "msyhbd.ttc"),
+            max(10, int(w / 110)))
+    except OSError:
+        font = ImageFont.load_default()
+    for i in range(1, 10):
+        x = int(w * i / 10.0)
+        y = int(h * i / 10.0)
+        # 深色虚线（浅底可见）叠浅色虚线（深底可见），错开 3px
+        for yy in range(0, h, 9):
+            d.line((x, yy, x, min(h, yy + 5)), fill=(0, 0, 0, 120), width=1)
+            d.line((x + 1, yy + 3, x + 1, min(h, yy + 7)), fill=(255, 255, 255, 150), width=1)
+        for xx in range(0, w, 9):
+            d.line((xx, y, min(w, xx + 5), y), fill=(0, 0, 0, 120), width=1)
+            d.line((xx + 3, y + 1, min(w, xx + 7), y + 1), fill=(255, 255, 255, 150), width=1)
+    # 刻度：顶部与左侧各标一次（100..900），带深色胶囊保证两种底色都看得清
+    for i in range(1, 10):
+        val = i * 100
+        px, py = int(w * i / 10.0), int(h * i / 10.0)
+        for tx, ty in ((px, 2), (2, py)):
+            tb = d.textbbox((0, 0), str(val), font=font)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            d.rounded_rectangle((tx - 2, ty - 1, tx + tw + 4, ty + th + 4),
+                                radius=4, fill=(0, 0, 0, 190))
+            d.text((tx + 1, ty), str(val), font=font, fill=(255, 255, 255, 245))
+    base = img.convert("RGBA")
+    base.alpha_composite(lay)
+    return base.convert("RGB")
+
+
+def _encode_png_img(img, long_edge, region=None, capture_path="gdi", grid=True):
     """把 PIL 图编码成 PNG 并产出 meta。缩放/token 估算口径只有这一处。"""
     src_w, src_h = img.size
     scale = 1.0
@@ -1911,6 +2008,11 @@ def _encode_png_img(img, long_edge, region=None, capture_path="gdi"):
         scale = k
     if img.size[0] <= 0 or img.size[1] <= 0:
         raise CuError("CU_SHOT_FAIL", "截出来的图是空的（%dx%d）" % img.size)
+    if grid:
+        try:
+            img = _grid_overlay(img)
+        except Exception:                                 # noqa: BLE001
+            pass                                          # 画坏了也不能让截图失败
     lit = _lit_ratio(img)
     buf = io.BytesIO()
     try:
@@ -1979,22 +2081,77 @@ def capture_shot(a):
                     box = (ix0 - wx, iy0 - wy, ix1 - wx, iy1 - wy)
                     img = img.crop(box)
                     region = [ix0, iy0, ix1, iy1]
-                png, meta = _encode_png_img(img, le, region, "printwindow")
+                png, meta = _encode_png_img(img, le, region, "printwindow",
+                                            grid=getattr(a, "grid", True))
                 meta["window"] = win.title[:38]
                 return png, meta
         except CuError:
             pass          # 落到下面的屏幕裁剪
     region, win_note, le2 = resolve_shot_region(a)
-    png, meta = capture_png(le2, region)
+    png, meta = capture_png(le2, region, grid=getattr(a, "grid", True))
     if win is not None:
         meta["window"] = win.title[:38]
     return png, meta
 
 
-def shot(out=None, long_edge=1280, region=None, keep_all=False):
+# 截图落定探针：把"首张正撞上动画"这种情况识别出来，等它稳定再补一张。
+SETTLE_PROBE_MS = 120
+SETTLE_MAX_WAIT_MS = 1600
+SETTLE_DIFF_RATIO = 0.008
+
+
+def _screen_fp():
+    """当前整屏的灰度指纹；抓不到就返回 None（隔离桌面/锁屏）。"""
+    try:
+        from PIL import ImageGrab
+        img = ImageGrab.grab(all_screens=True)
+        return _fingerprint(img)
+    except Exception:
+        return None
+
+
+def _fp_moved(a, b):
+    if not a or not b or a[0] != b[0] or a[1] != b[1]:
+        return True
+    ratio, _ = _diff(a[2], b[2], a[0], a[1])
+    return ratio > SETTLE_DIFF_RATIO
+
+
+def _settle_screen(max_ms=SETTLE_MAX_WAIT_MS):
+    """盯着整屏指纹，直到连续两帧不再明显变化。
+
+    返回 True 表示"确实看到过变化"（首张很可能撞上动画，值得补截）；
+    返回 False 表示画面本来就是静的（省掉补截）。
+    """
+    prev = _screen_fp()
+    if prev is None:
+        return False
+    moved = False
+    deadline = time.perf_counter() + max_ms / 1000.0
+    while time.perf_counter() < deadline:
+        time.sleep(SETTLE_PROBE_MS / 1000.0)
+        cur = _screen_fp()
+        if cur is None:
+            break
+        if _fp_moved(prev, cur):
+            moved = True
+            prev = cur
+            continue
+        break
+    return moved
+
+
+def shot(out=None, long_edge=1280, region=None, keep_all=False, settle=False, grid=True):
     """region 给 x,y,w,h（左上角 + 宽高，不是 l,t,r,b；单位是物理像素）。
-    给 long_edge 就等比缩放；长边不超过 long_edge 时保持原样（看小字要的就是这个）。"""
-    png, meta = capture_png(long_edge, region)
+    给 long_edge 就等比缩放；长边不超过 long_edge 时保持原样（看小字要的就是这个）。
+
+    settle=True：截完先探一眼屏幕是否还在动（动画/展开过渡/滚动惯性）。
+    在动就等它落定再补截一张，用后一张覆盖——避免把"播了一半"的画面喂给模型。
+    普通截图不开它：多花约 0.15–1.6s，代价要模型自己决定值不值。
+    """
+    png, meta = capture_png(long_edge, region, grid=grid)
+    if settle and _settle_screen():
+        png, meta = capture_png(long_edge, region, grid=grid)
     os.makedirs(SHOT_DIR, exist_ok=True)
     if out is None:
         out = os.path.join(SHOT_DIR, "cu_%d.png" % int(time.time() * 1000))
@@ -3053,6 +3210,10 @@ def _p_shot(sub):
     p.add_argument("--window", help="只截某个窗口（每次调用现读它的位置，窗口挪了也对）")
     p.add_argument("--full", action="store_true", help="不缩放，出原分辨率")
     p.add_argument("--keep-all", action="store_true", help="不清理旧截图")
+    p.add_argument("--settle", action="store_true",
+                   help="先探屏幕是否还在动；撞上动画/过渡就等落定后补截一张")
+    p.add_argument("--no-grid", action="store_false", dest="grid", default=True,
+                   help="不打 0-1000 归一化网格（默认打，方便按刻度取坐标）")
     p.add_argument("--emit-binary", action="store_true", dest="emit_binary",
                    help="（内部用）不落盘：先输出一行 JSON meta，再输出原始 PNG 字节。"
                         "给常驻服务与 --rpc 降级路径用；人不要手敲")
@@ -3681,6 +3842,9 @@ def run(a):
         audit(a.cmd, args, "attempted")
     if a.cmd == "shot":
         png, meta = capture_shot(a)
+        if getattr(a, "settle", False) and _settle_screen():
+            # 首张正撞上动画/过渡，等它落定后用新的一张覆盖
+            png, meta = capture_shot(a)
         os.makedirs(SHOT_DIR, exist_ok=True)
         out = a.out or os.path.join(SHOT_DIR, "cu_%d.png" % int(time.time() * 1000))
         if a.out:
@@ -3749,8 +3913,9 @@ def run(a):
     if a.cmd in ("click", "move", "hover"):
         if a.cmd == "move" or a.cmd == "hover":
             x, y = to_px(a.x, a.y)
-            move(x, y)
-            return ["光标 -> 像素(%d,%d) 归一化%s" % (x, y, (round(a.x, 2), round(a.y, 2)))]
+            _glide(x, y)
+            return ["光标 -> 像素(%d,%d) 归一化%s（已平滑移动）"
+                    % (x, y, (round(a.x, 2), round(a.y, 2)))]
         x, y = click(a.x, a.y, a.right, a.double, a.triple)
         what = "三击" if a.triple else ("双击" if a.double else ("右键" if a.right else "点击"))
         return ["%s 归一化(%.2f,%.2f) -> 像素(%d,%d)" % (what, a.x, a.y, x, y)]

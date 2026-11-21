@@ -43,7 +43,7 @@ import time
 import traceback
 from ctypes import wintypes as wt
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 # ---------------------------------------------------------------- win32 基元
 
@@ -156,6 +156,31 @@ def _screen_rect():
             u.GetSystemMetrics(SM_CXVIRTUALSCREEN), u.GetSystemMetrics(SM_CYVIRTUALSCREEN))
 
 
+def _monitors():
+    """每台显示器的物理矩形（EnumDisplayMonitors）。
+
+    为什么不能只用虚屏矩形：虚屏是包住所有显示器的大盒子，副屏和主屏一样大时它的
+    四条边只贴着最外侧，中间那台显示器根本收不到边；两台大小不同时，小屏的四条边
+    会落在离它边界有"固定距离"的地方——用户看到的就是"四条直线不在屏幕边上"。
+    """
+    out = []
+
+    def _cb(hmon, hdc, lprc, lparam):
+        r = lprc.contents
+        out.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        return True
+
+    try:
+        MONITORENUMPROC = ctypes.WINFUNCTYPE(
+            wt.BOOL, wt.HMONITOR, wt.HDC, ctypes.POINTER(wt.RECT), wt.LPARAM)
+        user32.EnumDisplayMonitors(None, None, MONITORENUMPROC(_cb), 0)
+    except Exception:
+        pass
+    if not out:
+        out.append(_screen_rect())
+    return out
+
+
 def _work_area():
     r = wt.RECT()
     if user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(r), 0):
@@ -188,23 +213,29 @@ def _scale_at(x: int, y: int) -> float:
         return _dpi_scale()
 
 
+_premult_cache = {}
+
+
 def _premultiply(img: Image.Image) -> bytes:
-    """RGBA -> 预乘 BGRA 字节串（UpdateLayeredWindow 要求）。"""
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    px = img.load()
-    w, h = img.size
-    out = bytearray(w * h * 4)
-    i = 0
-    for y in range(h):
-        for x in range(w):
-            pr, pg, pb, pa = px[x, y]
-            out[i] = (pb * pa) // 255
-            out[i + 1] = (pg * pa) // 255
-            out[i + 2] = (pr * pa) // 255
-            out[i + 3] = pa
-            i += 4
-    return bytes(out)
+    """RGBA -> 预乘 BGRA 字节串（UpdateLayeredWindow 要求）。
+
+    用 PIL 的通道运算代替逐像素 Python 循环：同一个 119x158 的鲸鱼帧，
+    逐像素要 3.3ms，240Hz 下等于一条核的 80% 全喂给它；通道乘完只要 0.3ms。
+    结果按图片对象缓存（鲸鱼 24 帧、边框 4 张都是稳定对象，缓存后是纯命中）。
+    """
+    key = (id(img), img.size)
+    hit = _premult_cache.get(key)
+    if hit is not None:
+        return hit
+    rgba = img if img.mode == "RGBA" else img.convert("RGBA")
+    r, g, b, a = rgba.split()
+    alpha_rgb = Image.merge("RGB", (a, a, a))
+    rgb = ImageChops.multiply(Image.merge("RGB", (r, g, b)), alpha_rgb)
+    out = Image.merge("RGBA", (*rgb.split(), a)).tobytes("raw", "BGRA")
+    if len(_premult_cache) > 64:      # 只是防呆：正常只有几十张
+        _premult_cache.clear()
+    _premult_cache[key] = out
+    return out
 
 
 class LayerWindow:
@@ -275,14 +306,17 @@ class LayerWindow:
             return 1
         return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
-    def present(self, img: Image.Image, x: int, y: int):
-        # 同一张图 + 同一位置 + 已经显示着：不需要重新上传（每帧重画 52x1600 的渐变太贵）
+    def present(self, img: Image.Image, x: int, y: int, alpha: int = 255):
+        alpha = max(0, min(255, int(alpha)))
+        # 同一张图 + 同一位置 + 同一透明度 + 已经显示着：不需要重新上传
+        # （每帧重画 52x1600 的渐变太贵）
         if (img is getattr(self, "_last_img", None) and (x, y) == self._pos
-                and self._visible):
+                and alpha == getattr(self, "_last_alpha", 255) and self._visible):
             return
         # 图没变、只是挪位置（光标光晕每帧都在动）：分层窗口的内容不用重传，
         # SetWindowPos 就够。这样 240Hz 跟手也不会把 CPU 烧掉。
-        if img is getattr(self, "_last_img", None) and self._size == img.size:
+        if (img is getattr(self, "_last_img", None) and self._size == img.size
+                and alpha == getattr(self, "_last_alpha", 255)):
             self._pos = (x, y)
             self._visible = True
             # sticky_zorder 的窗口（光标光晕）只在首次显示时置顶；之后挪位置不动 z 序。
@@ -296,6 +330,7 @@ class LayerWindow:
                                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
             return
         self._last_img = img
+        self._last_alpha = alpha
         w, h = img.size
         if (w, h) != self._size:
             self._size = (w, h)
@@ -321,7 +356,7 @@ class LayerWindow:
         pt_dst = wt.POINT(x, y)
         size = wt.SIZE(w, h)
         pt_src = wt.POINT(0, 0)
-        blend = BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+        blend = BLENDFUNCTION(AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA)
         user32.UpdateLayeredWindow(self.hwnd, screen_dc, ctypes.byref(pt_dst),
                                    ctypes.byref(size), self._memdc, ctypes.byref(pt_src),
                                    0, ctypes.byref(blend), ULW_ALPHA)
@@ -406,8 +441,13 @@ ACCENT_INK = (255, 255, 255)    # 蓝底白字
 ACCENT_HOVER = (58, 90, 240)
 STATUS_ACTIVE = (77, 107, 254)  # 控制中 = 品牌蓝
 STATUS_PAUSED = (146, 152, 164) # 状态条：已暂停
+STATUS_OK = (52, 199, 89)       # 留言已送达、模型正在响应
+STATUS_FAIL = (255, 59, 48)     # 留言递送失败
 DANGER = (216, 74, 62)          # 状态条/错误：急停
 PAUSED_INK = (146, 152, 164)
+BREATH_SECONDS = 2.6             # 鲸鱼呼吸一圈的时间（按时间走，不按帧数）
+HALO_BREATH_SECONDS = 1.0        # 光标光晕呼吸周期：用户要 1Hz
+HALO_BREATH_AMP = 0.25           # 半径 ±25%
 HERE = os.path.dirname(os.path.abspath(__file__))
 FONT_DIR = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
 _cache_font = {}
@@ -496,28 +536,73 @@ def halo_image(d: int = 44, color=None, strength: float = 0.55):
     return big.resize((d, d), Image.LANCZOS)
 
 
-def edge_image(size, color, peak: float, horizontal: bool, from_start: bool):
-    """一条向内柔和渐隐的边。
+def halo_frames(d: int = 72, color=None, n: int = 30):
+    """光标光晕的呼吸帧：半径按 1Hz 正弦在 ±25% 之间连续变化。
 
-    horizontal=True 表示渐变沿 x 走（左右边），否则沿 y 走（上下边）。
-    用一维 alpha 斜坡拉伸实现，避免逐像素 Python 循环（2560x78 也只要毫秒级）。
+    逐像素画 30 张太慢，所以只画一张最大尺寸的底图，再按帧缩放出不同半径。
+    帧率取 30（每秒吸/呼各一次，30 帧足够顺；再高也只是重复上传同一张图）。
     """
-    w, h = size
-    span = w if horizontal else h
-    alpha = bytearray(span)
+    dmax = max(8, int(round(d * (1.0 + HALO_BREATH_AMP))))
+    base = halo_image(dmax, color)
+    frames = []
+    for i in range(n):
+        k = 1.0 + HALO_BREATH_AMP * math.sin((i / n) * math.tau)
+        size = max(8, int(round(d * k)))
+        frames.append(base.resize((size, size), Image.LANCZOS))
+    return frames
+
+
+def _edge_ramp(span, peak, reverse=False):
+    """一维向内渐隐的 alpha 斜坡（0..255）。"""
+    out = []
     for i in range(span):
-        d = i if from_start else span - 1 - i
+        d = (span - 1 - i) if reverse else i
         k = d / max(1, span - 1)
-        a = peak * (1.0 - k) ** 1.7
-        alpha[i] = max(0, min(255, int(255 * a)))
-    ramp = Image.frombytes("L", (span, 1) if horizontal else (1, span), bytes(alpha))
-    if horizontal:
-        alpha_img = ramp.resize((span, h), Image.NEAREST)
-    else:
-        alpha_img = ramp.resize((w, span), Image.NEAREST)
-    img = Image.new("RGBA", (w, h), (color[0], color[1], color[2], 0))
-    img.putalpha(alpha_img)
-    return img
+        out.append(max(0, min(255, int(255 * peak * (1.0 - k) ** 1.7))))
+    return out
+
+
+def _ramp_img(size, ramp, vertical):
+    w, h = size
+    if vertical:
+        return Image.frombytes("L", (1, len(ramp)), bytes(ramp)).resize((w, h), Image.NEAREST)
+    return Image.frombytes("L", (len(ramp), 1), bytes(ramp)).resize((w, h), Image.NEAREST)
+
+
+def frame_images(w, h, th, color, peak):
+    """一屏四条边：left/right 竖向整条，top/bottom 横向内缩。
+
+    四角是重点：竖条的角格用 max(横向斜坡, 纵向斜坡) 合成——
+    既不会两窗叠加变浓，也不是把一条边粗暴切掉（那样接缝处会突然断掉）。
+    横向条从 x=th 开始，它在 x=th 处的 alpha 恰好等于竖条角格用 max
+    合成后的值，所以接缝两边数值连续。
+    """
+    th = max(1, min(th, w // 2, h // 2))
+    hx = _edge_ramp(th, peak, reverse=False)       # 从 x=0 向内
+    hx_rev = _edge_ramp(th, peak, reverse=True)    # 从 x=th-1 向内
+    vy = _edge_ramp(th, peak, reverse=False)       # 从 y=0 向内
+    vy_rev = _edge_ramp(th, peak, reverse=True)    # 从 y=h-1 向内
+
+    def vert_strip(reverse):
+        row = _ramp_img((th, h), hx_rev if reverse else hx, vertical=False)
+        v_top = _ramp_img((th, th), vy, vertical=True)
+        v_bot = _ramp_img((th, th), vy_rev, vertical=True)
+        a = Image.new("L", (th, h))
+        a.paste(row.crop((0, th, th, h - th)), (0, th))
+        a.paste(ImageChops.lighter(row.crop((0, 0, th, th)), v_top), (0, 0))
+        a.paste(ImageChops.lighter(row.crop((0, h - th, th, h)), v_bot), (0, h - th))
+        img = Image.new("RGBA", (th, h), (color[0], color[1], color[2], 0))
+        img.putalpha(a)
+        return img
+
+    left = vert_strip(False)
+    right = vert_strip(True)
+    inner = max(1, w - 2 * th)
+    top = Image.new("RGBA", (inner, th), (color[0], color[1], color[2], 0))
+    top.putalpha(_ramp_img((inner, th), vy, vertical=True))
+    bottom = Image.new("RGBA", (inner, th), (color[0], color[1], color[2], 0))
+    bottom.putalpha(_ramp_img((inner, th), vy_rev, vertical=True))
+    return left, right, top, bottom
 
 
 def _round_mask(size, radius):
@@ -650,6 +735,30 @@ def banner_image(title, sub, note, seconds, buttons, tone, scale):
     return img, hits, int(18 * s)
 
 
+def note_image(text, scale, max_w=340):
+    """右下角的小回执卡：agent 用 reply 回答用户之后，把这句话显示在鲸鱼上方。
+
+    之前 note 命令只存不画，用户根本看不到 agent 的回复（工具侧消息的闭环断了）。
+    """
+    s = scale
+    f = _font(int(12.5 * s))
+    pad = int(12 * s)
+    w = int(max_w * s)
+    lines = _wrap(f, text, w - pad * 2)[:4]
+    line_h = int(18 * s)
+    h = pad * 2 + line_h * len(lines)
+    content = Image.new("RGBA", (w, h), SURFACE + (252,))
+    d = ImageDraw.Draw(content)
+    d.rounded_rectangle((0, 0, w - 1, h - 1), radius=int(10 * s),
+                        fill=SURFACE + (252,), outline=SURFACE_EDGE + (255,),
+                        width=max(1, int(s)))
+    y = pad
+    for ln in lines:
+        d.text((pad, y), ln, font=f, fill=SUB_INK + (255,))
+        y += line_h
+    return panel_image(content, int(10 * s))
+
+
 def _whale_source():
     """真正的 DeepSeek 鲸鱼：直接用程序自带的 icon.png（深色鲸鱼、白底圆角方）。
 
@@ -683,17 +792,18 @@ def _whale_source():
 _WHALE = None
 
 
-def _logo_core(d: int, color, state: str = "active"):
+def _logo_core(d: int, color, state: str = "active", label: str = None):
     """logo 静态部分：白底圆盘 + 官方鲸鱼（黑），下方一行状态字。
 
-    状态字是用户要求的"一眼看出它在干活还是停了"：控制中=琥珀，已暂停=灰蓝。
-    返回 (图, 盘心, 总高)；图比圆盘高一块，多出来的是给状态字留的。
+    状态字是用户要求的"一眼看出它在干活还是停了"：控制中=蓝，已暂停=灰蓝。
+    label 非空时覆盖默认状态字（操作中/思考中/后台执行中…）。
+    返回 (图, 画布尺寸, 总高)；图比圆盘高一块，多出来的是给状态字留的。
     """
     ss = 3
     size = d * ss
     # 状态字区：字形高度实测 + 上下留白。之前 0.30d 固定高，d=93 时字底贴着画布边缘，
     # 实拍里就是"文字被截断"。
-    text = LOGO_LABEL.get(state, LOGO_LABEL["active"])
+    text = label or LOGO_LABEL.get(state, LOGO_LABEL["active"])
     try:
         font = ImageFont.truetype(os.path.join(FONT_DIR, "msyhbd.ttc"), max(11, int(d * 0.20)))
     except OSError:
@@ -701,12 +811,15 @@ def _logo_core(d: int, color, state: str = "active"):
     probe = ImageDraw.Draw(Image.new("RGBA", (8, 8)))
     tb = probe.textbbox((0, 0), text, font=font)
     glyph_h = tb[3] - tb[1]
+    tw = tb[2] - tb[0]
+    # 状态字可能比圆盘宽（「后台执行中」），画布跟着加宽，免得被切掉。
+    cw = max(d, tw + int(d * 0.16))
     label_h = glyph_h + int(d * 0.22)
     total_h = d + label_h
     c = size / 2.0
     body_r = c - 5.0 * ss
 
-    base = Image.new("RGBA", (d, total_h), (0, 0, 0, 0))
+    base = Image.new("RGBA", (cw, total_h), (0, 0, 0, 0))
     disc = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     mask = Image.new("L", (size, size), 0)
     ImageDraw.Draw(mask).ellipse((c - body_r, c - body_r, c + body_r, c + body_r), fill=255)
@@ -715,7 +828,7 @@ def _logo_core(d: int, color, state: str = "active"):
         (c - body_r, c - body_r, c + body_r, c + body_r),
         outline=SURFACE_EDGE + (255,), width=max(1, int(1.2 * ss)))
     disc = disc.resize((d, d), Image.LANCZOS)
-    base.alpha_composite(disc, (0, 0))
+    base.alpha_composite(disc, (int(cw / 2 - d / 2), 0))
 
     whale = _whale_source()
     if whale is not None:
@@ -727,29 +840,30 @@ def _logo_core(d: int, color, state: str = "active"):
         wm = wmask.resize((nw, nh), Image.LANCZOS)
         ink = Image.new("RGBA", (nw, nh), LOGO_INK + (255,))
         ink.putalpha(wm)
-        base.alpha_composite(ink, (int(d / 2 - nw / 2), int(d / 2 - nh / 2)))
+        base.alpha_composite(ink, (int(cw / 2 - nw / 2), int(d / 2 - nh / 2)))
 
-    tw = tb[2] - tb[0]
-    tx = int((d - tw) / 2)
+    tx = int((cw - tw) / 2)
     ty = d + int(label_h * 0.34)
     td = ImageDraw.Draw(base)
-    # 浅色底上的字：先描一圈极淡的白色，压住深色壁纸；再上主色
-    for dx, dy in ((0, 1), (1, 0), (0, -1), (-1, 0)):
-        td.text((tx + dx, ty + dy), text, font=font, fill=(255, 255, 255, 90))
-    td.text((tx, ty), text, font=font, fill=color + (240,))
-    return base, (d, total_h), total_h
+    # 深色胶囊 + 白字：白描边在深色壁纸/浅色窗口上都糊成一团（用户反馈「白边难辨认」），
+    # 改成给文字一块实心底，任何底色上都读得清。
+    px, py = int(d * 0.10), int(d * 0.05)
+    td.rounded_rectangle((tx - px, ty - py, tx + tw + px, ty + glyph_h + py),
+                         radius=int(glyph_h * 0.55), fill=(18, 20, 26, 214))
+    td.text((tx, ty - int(glyph_h * 0.12)), text, font=font, fill=(255, 255, 255, 250))
+    return base, (cw, total_h), total_h
 
 
-def logo_frames(d: int, color, state: str = "active", n: int = 24):
+def logo_frames(d: int, color, state: str = "active", n: int = 24, label: str = None):
     """呼吸帧：静态核心 + 每帧两层柔光环。
 
     光环的外半径会超出圆盘，如果画在 d×d 画布上，环会被边缘切出直线（实拍里那道
     直线切口）。所以整张画布按 1.3d 开，圆盘居中，环在最外层也留了模糊余量——
     四周边缘必须完全透明，`tests/test_overlay_art.py` 会盯着这条。
     """
-    core, (w, total_h), _ = _logo_core(d, color, state)
+    core, (cw0, total_h), _ = _logo_core(d, color, state, label)
     pad = int(d * 0.15)                      # 四周留够模糊余量
-    cw, ch = d + pad * 2, total_h + pad * 2
+    cw, ch = cw0 + pad * 2, total_h + pad * 2
     cx = cw / 2.0
     disc_c = d / 2.0                         # 圆盘半径（相对 d）
     out = []
@@ -820,21 +934,41 @@ class Renderer(threading.Thread):
         self.mode = "idle"
         self.border_on = False
         self.halo_on = False
+        self.halo_color = None      # None = 跟随状态色
         self.logo_on = False
         self.logo_state = "active"
+        self.logo_label = None      # 覆盖状态字（操作中/思考中/后台执行中…）
+        self.logo_color = None      # 覆盖呼吸环颜色（留言送达=绿、失败=红）
         self.banner = None          # dict(text/sub/note/seconds/buttons/tone/deadline)
-        self.flash_until = 0.0
+        # 鲸鱼旁边的小回执卡：agent 用 reply 回答过用户之后，把自己的话说一遍给用户看。
+        # 顶部横幅只留给"启动申请 / 关闭提示"，所以回执走右下角，跟鲸鱼同一个角落。
+        self.note = None            # dict(text, deadline)
+        self.flash_t0 = 0.0         # 闪烁起点（按时间算，不按帧）
+        self.flash_n = 0            # 呼吸几下
         self.flash_color = RED
         self.border_peak = 0.5
         self.border_color = STATUS_ACTIVE
-        self._border_imgs = None
+        self._border_cache = {}     # 每台显示器一份边条图缓存
         self._halo_img = None
         self._halo_pos = None
+        self._halo_frames = None
+        self._halo_d = 0
+        self._halo_col = None
+        self._halo_t0 = time.time()
+        self._halo_idx = -1
         self._logo_frames = None
+        self._logo_key = None
         self._logo_d = 0
         self._logo_phase = 0.0
+        # 呼吸节奏按"时间"走，不按帧数：这台机是 240Hz，按帧推进会让鲸鱼每 0.1 秒
+        # 呼吸一次（看起来在抖），而且每帧都要重传一次带 alpha 的整图。
+        # 现在一圈固定 BREATH_SECONDS，且只在帧号变化时才上传。
+        self._logo_t0 = time.time()
+        self._logo_idx = -1
+        self._logo_pos = None
         self._last_banner_key = None
-        self._last_border_key = None
+        self._note_key = None
+        self._note_img = None
         self._banner_hits = {}
         self._banner_pad = 0
         self._wins_ready = False
@@ -849,15 +983,16 @@ class Renderer(threading.Thread):
         """
         if self._wins_ready:
             return
-        self.w_border = [LayerWindow("cu-border-%d" % i) for i in range(4)]
+        self._border_wins = []   # 每组 4 条边，对应一台显示器；按需增建
         self.w_halo = LayerWindow("cu-halo")
         # 光晕每帧都在动，但 z 序只在第一次显示时置顶（否则会跟鲸鱼互相顶，见 present）
         self.w_halo.sticky_zorder = True
         self.w_banner = LayerWindow("cu-banner", click_through=False,
                                     on_click=self._banner_click)
+        self.w_note = LayerWindow("cu-note")
         self.w_logo = LayerWindow("cu-logo", click_through=False,
                                   on_click=lambda *a: self.emit({"event": "logo_click"}))
-        for w in self.w_border + [self.w_halo, self.w_banner, self.w_logo]:
+        for w in [self.w_halo, self.w_banner, self.w_note, self.w_logo]:
             w.hide()
         self._wins_ready = True
 
@@ -869,6 +1004,7 @@ class Renderer(threading.Thread):
                 self.mode = "idle"
                 self.border_on = self.halo_on = self.logo_on = False
                 self.banner = None
+                self.note = None
                 self.flash_until = 0.0
                 return
             if k == "border":
@@ -879,12 +1015,20 @@ class Renderer(threading.Thread):
                     self.border_peak = float(cmd["alpha"])
             elif k == "halo":
                 self.halo_on = bool(cmd.get("on", True))
+                if cmd.get("color") is not None:
+                    col = _rgb(cmd["color"]) if cmd.get("color") else None
+                    if col != self.halo_color:
+                        self.halo_color = col
+                        self._halo_frames = None      # 换色要重画全部呼吸帧
             elif k == "logo":
                 self.logo_on = bool(cmd.get("on", True))
                 st = str(cmd.get("state") or "active")
-                if st != self.logo_state:
-                    self.logo_state = st
-                    self._logo_frames = None      # 换状态要重画（字和环色都变）
+                label = cmd.get("label")
+                label = str(label)[:12] if label else None
+                col = _rgb(cmd["color"]) if cmd.get("color") else None
+                if (st, label, col) != (self.logo_state, self.logo_label, self.logo_color):
+                    self.logo_state, self.logo_label, self.logo_color = st, label, col
+                    self._logo_frames = None      # 换状态/字/环色都要重画
             elif k == "banner":
                 self.banner = {
                     "text": cmd.get("text", ""),
@@ -898,8 +1042,16 @@ class Renderer(threading.Thread):
                 self.mode = cmd.get("tone", "consent")
             elif k == "hide_banner":
                 self.banner = None
+            elif k == "note":
+                text = str(cmd.get("text") or "").strip()[:400]
+                secs = int(cmd.get("seconds", 8) or 8)
+                self.note = {"text": text, "seconds": secs,
+                             "deadline": time.time() + secs} if text else None
             elif k == "flash":
-                self.flash_until = time.time() + 0.45 * int(cmd.get("times", 2) or 2)
+                # 快速呼吸：只记"从此刻起呼吸几下"，透明度由渲染线程按时间曲线算，
+                # 不在这里改 border_peak（那会让每帧都重画一张渐变图，正是闪烁的来源）。
+                self.flash_t0 = time.time()
+                self.flash_n = max(1, min(6, int(cmd.get("times", 3) or 3)))
                 self.flash_color = _rgb(cmd.get("color", "#FF3B30"))
             elif k == "quit":
                 self.running = False
@@ -948,8 +1100,28 @@ class Renderer(threading.Thread):
                 except Exception:
                     pass
 
+    def _flash_env(self, now):
+        """闪烁包络：(颜色, 透明系数)。系数 0..1，三下平滑呼吸后归零。
+
+        形状：每下 0.34s，sin² 上升/回落（没有硬切，所以不会像频闪灯）；
+        最后一下的尾段额外线性淡出，避免"啪"地消失。
+        """
+        if self.flash_n <= 0:
+            return None, 0.0
+        period = 0.42
+        total = period * self.flash_n
+        t = now - self.flash_t0
+        if t < 0 or t >= total:
+            return None, 0.0
+        frac = (t % period) / period
+        k = 0.16 + 0.84 * (math.sin(math.pi * frac) ** 2)
+        tail = total - t
+        if tail < 0.2:
+            k *= max(0.0, tail / 0.2)
+        return self.flash_color, k
+
     def _visible(self):
-        return bool(self.banner or self.flash_until > time.time()
+        return bool(self.banner or self._flash_env(time.time())[1] > 0.0
                     or self.border_on or self.halo_on or self.logo_on)
 
     def _pump(self):
@@ -969,40 +1141,60 @@ class Renderer(threading.Thread):
             self.scale = sc
             self._halo_img = None
             self._logo_frames = None
-            self._border_imgs = None
-            self._last_border_key = None
+            self._border_cache = {}
             self._last_banner_key = None
         with self.lock:
             mode = self.mode
             border_on, halo_on, logo_on = self.border_on, self.halo_on, self.logo_on
             banner = dict(self.banner) if self.banner else None
-            flashing = now < self.flash_until
+            note = dict(self.note) if self.note else None
+            if note and now > note["deadline"]:
+                self.note = note = None
+            fcol, fk = self._flash_env(now)
             peak = self.border_peak
-            color = self.flash_color if flashing else self.border_color
+            color = self.border_color
+            alpha = 255
+            flashing = fcol is not None and fk > 0.0
             if flashing:
-                peak = 0.55 + 0.25 * math.sin(now * 26.0)
+                # 渐变图固定按"满强度"预画一次，闪烁只改窗口整体 alpha。
+                # 这样渐变形状不会随强度变化被重画（旧实现每帧重画 → 频闪 + 叠加）。
+                color = fcol
+                peak = 0.95
+                # 量化到 8 级：40fps 下肉眼看不出台阶，但整图上传少到 1/8，
+                # 避免四条 52x1600 的位图每帧重传拖慢渲染线程。
+                alpha = int(round(255 * fk / 8.0)) * 8
 
-        sx, sy, sw, sh = _screen_rect()
-        thick = int(52 * self.scale)
-
-        if border_on and peak > 0.01:
-            key = (round(peak, 2), color, (sw, sh), thick)
-            if key != self._last_border_key:
-                self._last_border_key = key
-                self._border_imgs = [
-                    edge_image((thick, sh), color, peak, True, True),
-                    edge_image((thick, sh), color, peak, True, False),
-                    edge_image((sw, thick), color, peak, False, True),
-                    edge_image((sw, thick), color, peak, False, False),
-                ]
-            imgs = self._border_imgs
-            self.w_border[0].present(imgs[0], sx, sy)
-            self.w_border[1].present(imgs[1], sx + sw - thick, sy)
-            self.w_border[2].present(imgs[2], sx, sy)
-            self.w_border[3].present(imgs[3], sx, sy + sh - thick)
-        else:
-            for w in self.w_border:
+        mons = _monitors()
+        # 每台显示器一组四条边：虚屏矩形只贴最外侧，多屏/不同 DPI 时会画到离边界
+        # 固定距离的地方。这里按 EnumDisplayMonitors 逐屏各画一圈。
+        while len(self._border_wins) < len(mons):
+            i = len(self._border_wins)
+            wins = [LayerWindow("cu-border-%d-%d" % (i, j)) for j in range(4)]
+            for w in wins:
                 w.hide()
+            self._border_wins.append(wins)
+        for extra in self._border_wins[len(mons):]:
+            for w in extra:
+                w.hide()
+
+        for idx, (mx, my, mw, mh) in enumerate(mons):
+            wins = self._border_wins[idx]
+            # 非闪烁时用渐变峰值判可见；闪烁时渐变恒定、看整窗 alpha。
+            if not (border_on and (alpha > 4 if flashing else peak > 0.01)):
+                for w in wins:
+                    w.hide()
+                continue
+            th = max(6, int(52 * _scale_at(mx + mw // 2, my + mh // 2)))
+            key = (round(peak, 2), color, (mw, mh), th)
+            cache = self._border_cache.setdefault(idx, {})
+            if cache.get("key") != key:
+                cache["key"] = key
+                cache["imgs"] = list(frame_images(mw, mh, th, color, peak))
+            imgs = cache["imgs"]
+            wins[0].present(imgs[0], mx, my, alpha)
+            wins[1].present(imgs[1], mx + mw - th, my, alpha)
+            wins[2].present(imgs[2], mx + th, my, alpha)
+            wins[3].present(imgs[3], mx + th, my + mh - th, alpha)
 
         if halo_on:
             cx, cy = _cursor()
@@ -1011,12 +1203,28 @@ class Renderer(threading.Thread):
             r = getattr(self, "_logo_rect", None)
             if r and r[0] - 8 <= cx <= r[0] + r[2] + 8 and r[1] - 8 <= cy <= r[1] + r[3] + 8:
                 self.w_halo.hide()
+                self._halo_idx = -1
             else:
                 hd = int(72 * _scale_at(cx, cy))
-                if self._halo_img is None or self._halo_img.size[0] != hd:
-                    self._halo_img = halo_image(hd)
-                # 和指针同心：用户要"对得上"，不是飘在下面。
-                self.w_halo.present(self._halo_img, cx - hd // 2, cy - hd // 2)
+                # 暂停时灰蓝，正常时品牌蓝；服务端可用 halo{color} 覆盖。
+                col = self.halo_color or (PAUSED_INK if mode == "paused" else STATUS_ACTIVE)
+                if self._halo_frames is None or self._halo_d != hd or self._halo_col != col:
+                    self._halo_frames = halo_frames(hd, col)
+                    self._halo_d, self._halo_col = hd, col
+                    self._halo_t0 = now
+                    self._halo_idx = -1
+                n = len(self._halo_frames)
+                # 半径按时间正弦呼吸（1Hz、±25%），帧号只在变化时才上传。
+                idx = int(((now - self._halo_t0) % HALO_BREATH_SECONDS)
+                          / HALO_BREATH_SECONDS * n) % n
+                img = self._halo_frames[idx]
+                size = img.size[0]
+                x, y = cx - size // 2, cy - size // 2
+                if idx != self._halo_idx or (x, y) != self._halo_pos:
+                    self._halo_idx = idx
+                    self._halo_pos = (x, y)
+                    # 和指针同心：用户要"对得上"，不是飘在下面。
+                    self.w_halo.present(img, x, y)
         else:
             self.w_halo.hide()
 
@@ -1024,21 +1232,49 @@ class Renderer(threading.Thread):
             wx, wy, ww, wh = _work_area()
             ls = _scale_at(wx + ww - int(40 * self.scale), wy + wh - int(40 * self.scale))
             d = int(62 * ls)
-            self._logo_phase += 0.02
-            if self._logo_frames is None or self._logo_d != d:
-                color = PAUSED_INK if self.logo_state == "paused" else STATUS_ACTIVE
-                self._logo_frames = logo_frames(d, color, self.logo_state)
+            lcolor = self.logo_color or (STATUS_FAIL if self.logo_state == "failed" else
+                                         PAUSED_INK if self.logo_state == "paused" else STATUS_ACTIVE)
+            lkey = (d, lcolor, self.logo_state, self.logo_label)
+            if self._logo_frames is None or self._logo_key != lkey:
+                self._logo_frames = logo_frames(d, lcolor, self.logo_state,
+                                                label=self.logo_label)
+                self._logo_key = lkey
                 self._logo_d = d
-            img = self._logo_frames[int(self._logo_phase * len(self._logo_frames)) %
-                                    len(self._logo_frames)]
+                self._logo_idx = -1
+                self._logo_pos = None
+            n = len(self._logo_frames)
+            phase = ((now - self._logo_t0) % BREATH_SECONDS) / BREATH_SECONDS
+            idx = int(phase * n) % n
+            img = self._logo_frames[idx]
             iw, ih = img.size
             lx = wx + ww - iw - int(16 * ls)
             ly = wy + wh - ih - int(16 * ls)
             self._logo_rect = (lx, ly, iw, ih)
-            self.w_logo.present(img, lx, ly)
+            if idx != self._logo_idx or (lx, ly) != self._logo_pos:
+                self._logo_idx = idx
+                self._logo_pos = (lx, ly)
+                self.w_logo.present(img, lx, ly)
         else:
             self._logo_rect = None
             self.w_logo.hide()
+
+        if note:
+            ls = _scale_at(*_cursor())
+            key = (note["text"], ls)
+            if key != self._note_key:
+                self._note_key = key
+                self._note_img = note_image(note["text"], ls)
+            nimg = self._note_img
+            nw_, nh_ = nimg.size
+            lr = getattr(self, "_logo_rect", None)
+            if lr:
+                nx, ny = lr[0] + lr[2] - nw_, lr[1] - nh_ - int(4 * ls)
+            else:
+                wx, wy, ww, wh = _work_area()
+                nx, ny = wx + ww - nw_ - int(16 * ls), wy + wh - nh_ - int(96 * ls)
+            self.w_note.present(nimg, nx, ny)
+        else:
+            self.w_note.hide()
 
         if banner:
             wx, wy, ww, wh = _work_area()

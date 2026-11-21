@@ -74,3 +74,10 @@
 - `idle_ttl` / `max_ttl`：两个数值参数，影响"多久自动收回"，属于契约。
 - `CU_*` 错误码：模型靠它决定下一步，保留。
 - `shot` / `state_capture` / `watch_*` / `browser_use`：动作名与"网页用另一个工具"的分工。
+
+## 第十轮新增（2026-11-20）
+
+- `thinking_control` 工具（常驻，约 350 字符）：action=set/status/restore，effort=off/low/high/max，why 可选。它是模型自己调"下一步思考多深"的唯一入口。
+- `computer_use` 新增参数 `settle`（截图前探屏幕是否在动，撞上动画自动补截）。
+- activate 成功文案新增一行：思考已降到 off、怎么调高、交还时恢复原档位。
+- 使用中注入新增：阶段字（操作中/思考中/等待中/提问中/观察中/后台执行中/申请中）走 `phase` op，不占模型 token；投递状态（已送达/递送失败/待回复）走 `relay` op，只上屏。

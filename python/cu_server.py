@@ -21,6 +21,7 @@
 import ctypes
 import json
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -55,6 +56,28 @@ DEFAULT_CONNECT_TIMEOUT = 5.0
 DEFAULT_IO_TIMEOUT = 30.0
 # 对齐豆包 client.py：主传输有兜底时只给 0.5s 的尝试窗口，免得 5s 全耗在死路上
 IPC_CONNECT_TIMEOUT_WITH_FALLBACK = 0.5
+
+# 本次使用 cu 的强度：让用户一眼看出这台电脑接下来会被怎么用。
+#   script_main = 主要脚本实现，键鼠零星使用
+#   unknown     = 我不知道，视情况而定
+#   gui_main    = 主要键鼠实现，脚本零星使用
+INTENSITY_LABELS = {
+    "script_main": "主要脚本实现，键鼠零星使用",
+    "unknown": "我不知道，视情况而定",
+    "gui_main": "主要键鼠实现，脚本零星使用",
+}
+
+# 控制权是怎么没的：agent 拿到 closed 时必须同时拿到原因，否则它会拿激活文案里的
+# "空闲 N 秒"当答案（2026-11-20 实测：用户按了急停，模型却告诉用户"闲置了 600 秒"）。
+_STOP_DETAIL = {
+    "emergency": "用户按了急停（Ctrl+Alt+Shift+Backspace）",
+    "deactivate": "agent 主动交还了控制权",
+    "idle-timeout": "控制权因长时间没有操作被系统收回",
+    "max-ttl": "单次激活到达时长上限，控制权已收回",
+    "turn-end": "本回合结束，cu 随之关闭",
+    "manual": "用户手动关闭了 cu",
+    "stop": "cu 已关闭",
+}
 
 
 # ---------------------------------------------------------------- 传输配置
@@ -563,20 +586,45 @@ class Server:
         self._hotkey_prev = {"emergency": False, "agree": False}
         self.notices = []                   # 待推给 agent 的提示：[{id, text}]
         self._notice_seq = 0                # 提示 id：客户端 ack 之后才删
-        self.inbox = self._inbox_load()     # 用户留言：落盘，服务被关掉也不丢
-        self.notices.extend(self.inbox)
+        # 新实例不继承旧会话的留言/停机说明：上一轮死了就死了，不能让新会话一上来
+        # 就收到"你被关了""用户手动关闭"这种过期的病话（用户 2026-11-20 要求）。
+        self.inbox = []
+        try:
+            if self._inbox_load():
+                log("丢弃上次遗留的留言（新实例不继承旧会话）")
+            self._inbox_save()
+        except Exception:                             # noqa: BLE001
+            pass
         self.user_msgs = []                 # 给 agent.followup() 用的留言队列
+        self.inflight = {}                  # 已认领、等 ack 的留言：id -> {item, at}
         self.msg_evt = threading.Event()    # 新留言 / cu 关闭时唤醒 `wait` 长轮询
         self._user_msg_seq = 0
         self.last_user_input = 0.0
         self._user_input_evt = threading.Event()
         self.session = ""                   # 当前持租约的会话（横幅上告诉用户"是哪个会话"）
+        self.session_title = ""             # 用户给这个会话起的名字（可在面板里改）
         self.cwd = ""                       # 该会话的工作目录（只取末段显示）
+        # 右下角鲸鱼的状态字 / 呼吸环颜色：由 agent 的调用阶段驱动。
+        self._logo_state = "active"
+        self._logo_label = None
+        self._phase_at = 0.0
+        self._logo_color = None
+        # agent 亲手写的自我介绍 + 本次使用强度：activate 必填，用户点同意之前就要看见。
+        self.intro = ""
+        self.intensity = ""
+        # 用户从递话框发来、agent 还没 reply 的那句话。非空时注入被 CU_UNANSWERED 拦住。
+        self.pending_reply = None           # dict(id, text, at)
+        # 控制权是怎么没的：agent 只能看到 closed:true，不告诉它原因它就会自己编
+        # （"闲置 600 秒"就是这么来的）。reason 取值：emergency/deactivate/idle-timeout/
+        # turn-end/expired/manual，另有 detail 给人看的一句话。
+        self.stop_reason = ""
+        self.stop_detail = ""
+        self.revoke_reason = ""
+        self.revoke_detail = ""
         self.dialog_open = False
         # 生产语义：交还/急停之后 cu 要彻底退出，不留后台。测试里设
         # DSH_CU_STAY_ALIVE=1 让它活着，好连续断言状态机。
         self.stay_alive = os.environ.get("DSH_CU_STAY_ALIVE") == "1"
-        self._seed_stop_notice()
         threading.Thread(target=self._control_ticker, name="cu-control-ticker",
                          daemon=True).start()
         threading.Thread(target=self._hotkey_loop, name="cu-hotkeys",
@@ -626,7 +674,7 @@ class Server:
                 if bad >= 2:                          # 连续两次（约 1 秒）才算数，避开瞬时切换
                     log("提示层不可见，立即收工（提示消失就必须停止控制）")
                     self._push_notice("【已自动关闭】屏幕上看不到控制提示了，"
-                                      "所以控制已立刻停止（这是硬规则）。", persist=True)
+                                      "所以控制已立刻停止（这是硬规则）。")
                     self._full_stop("visual-lost")
                     return
             except Exception:                         # noqa: BLE001
@@ -646,24 +694,44 @@ class Server:
 
     # ---- 存在感层（边框 / 光晕 / logo / 横幅）----
     def _session_line(self, owner=None):
-        """横幅第二行：哪个会话在手、在哪个目录。会话 id 写全，别用"主 agent"这种自封称呼。"""
-        s = self.session or ""
+        """横幅第二行：哪个会话在手、在哪个目录、这次用多大强度的键鼠。"""
+        # 用用户在面板里给会话起的名字，而不是 session 号——用户看不懂 UUID。
+        s = self.session_title or self.session or ""
         cwd = self.cwd or ""
         bits = []
         if s:
             bits.append("会话 %s" % s)
         if cwd:
             bits.append("目录 %s" % (os.path.basename(cwd.rstrip("\\/")) or cwd))
+        if self.intensity in INTENSITY_LABELS:
+            bits.append("强度 %s" % INTENSITY_LABELS[self.intensity])
         return " · ".join(bits) or "（未上报会话）"
 
+    def _logo(self, state=None, label=None, color=None):
+        """右下角鲸鱼：状态字 + 呼吸环颜色。
+
+        color=None 表示"没改"；color="" 表示回到状态默认色（蓝/灰）。
+        """
+        if state is not None:
+            self._logo_state = state
+        if label is not None:
+            self._logo_label = label or None
+        if color is not None:
+            self._logo_color = color or None
+        self.overlay.send(cmd="logo", on=True, state=self._logo_state,
+                          label=self._logo_label, color=self._logo_color)
+
     def _show_active(self, owner, banner_seconds=5):
+        # 新一轮激活：上一次"为什么关"的账不能带到这一轮
+        self.stop_reason = self.stop_detail = ""
+        self.revoke_reason = self.revoke_detail = ""
         self.overlay.send(cmd="border", on=True, color="#4D6BFE", alpha=0.42)
         self.overlay.send(cmd="halo", on=True)
-        self.overlay.send(cmd="logo", on=True, state="active")
+        self._logo(state="active")
         sub = self._session_line()
         self.overlay.send(
             cmd="banner",
-            text="正在控制这台电脑",
+            text=("「%s」正在控制这台电脑" % self.intro) if self.intro else "正在控制这台电脑",
             sub=sub,
             note="手动关闭 Ctrl+Alt+Shift+Backspace · 暂停 Ctrl+Shift+Alt",
             seconds=int(banner_seconds), buttons=False, tone="active")
@@ -679,7 +747,7 @@ class Server:
         """
         self.overlay.send(cmd="border", on=True, color="#8A8F98", alpha=0.32)
         self.overlay.send(cmd="halo", on=False)
-        self.overlay.send(cmd="logo", on=True, state="paused")
+        self._logo(state="paused", label="", color="")
         self.overlay.send(cmd="hide_banner")
 
     def _show_idle(self):
@@ -704,6 +772,10 @@ class Server:
                               "不要重试刚失败的动作，也不要自己找活干。")
             self._show_paused()
         else:
+            # 用户自己按回来 = 他不再等这句回答，未答的留言一并放行，免得永远卡住。
+            with self.control_lock:
+                self.control.pending_reply = False
+                self.pending_reply = None
             self._push_notice("cu 已恢复，观察屏幕并继续操作。")
             owner = (self.control.lease or {}).get("owner") or "代理"
             self._show_active(owner, banner_seconds=3)
@@ -738,59 +810,139 @@ class Server:
         return {"asked": True, "text": text, "paused": True}
 
     def _on_logo_click(self):
-        """右下角鲸鱼：控制中 → 暂停并弹出留言框；已暂停 → 直接恢复工作。"""
+        """右下角鲸鱼：控制中 → 暂停并弹出留言框；已暂停 → 只弹留言框，不解除暂停。
+
+        用户的意思很明确：暂停是他按的，恢复必须由他按回来；点鲸鱼只是"我想说句话"。
+        """
         with self.control_lock:
             if not self.control.lease or self.control.emergency:
                 return
             paused = self.control.paused
-        if paused:  # 再点一下 = 恢复，跟热键同一个语义
-            self._pause_toggle("logo")
-            self.overlay.close_dialog()
-            self.dialog_open = False
-            return
-        with self.control_lock:
-            self.control.set_paused(True)
-            self.control.touch()
-            cu.audit("control", {}, "paused_for_chat")
-        self._show_paused()
+        if not paused:
+            with self.control_lock:
+                self.control.set_paused(True)
+                self.control.touch()
+                cu.audit("control", {}, "paused_for_chat")
+            self._show_paused()
         self.dialog_open = True
-        title = "对「%s」说点什么" % ((self.control.lease or {}).get("owner") or "代理")
+        title = "对「%s」说点什么" % (self.intro or "这个会话")
         try:
             self.overlay.dialog(
                 title,
-                "已暂停鼠标键盘操作。发出后 agent 会继续，并看到你的这句话；"
-                "不想说话就再点一次鲸鱼，或按 Ctrl+Shift+Alt。",
+                "已暂停鼠标键盘操作。你说完，agent 会先回你一句再继续；"
+                "想自己恢复就按 Ctrl+Shift+Alt。",
                 self._on_user_message,
                 lambda: setattr(self, "dialog_open", False))
         except Exception as e:  # 对话框起不来不能把 overlay 读线程带走
             log("对话框起不来：%r" % (e,))
 
     def _on_user_message(self, text, from_dialog=False):
+        """用户在递话框里说了话：保持暂停，等 agent 用 reply 回一句。
+
+        规则（用户 2026-11-18 要求）：工具侧来的话必须从工具侧回答；在回答之前
+        不许动键鼠，防止 agent 一边"没听见"一边继续干活。
+        """
         self.dialog_open = False
         if not text.strip():
             return
-        text = text.strip()
-        # 三种情形对模型说的话不一样：纯留言 / 暂停期间留言（顺带恢复）/ 主动提问的回答
-        if self.control.lease and not self.control.emergency:
-            notice = "cu 已恢复，用户有新指令：%s" % text
-        else:
-            notice = "用户留言：%s" % text
-        self._push_notice(notice, persist=True)
+        text = text.strip()[:2000]
         self._user_msg_seq += 1
-        self.user_msgs.append({"id": self._user_msg_seq, "text": text.strip(),
-                               "at": time.time(),
+        mid = self._user_msg_seq
+        with self.control_lock:
+            if self.control.lease and not self.control.emergency:
+                self.control.set_paused(True, "waiting_reply")
+                self.control.pending_reply = True
+                self.pending_reply = {"id": mid, "text": text, "at": time.time()}
+                self.control.touch()
+        self.user_msgs.append({"id": mid, "text": text, "at": time.time(),
                                "owner": (self.control.lease or {}).get("owner") or ""})
-        log("用户留言：%s" % text.strip())
-        self.msg_evt.set()                  # 有人正在 `wait` 里等，立刻叫醒
+        self._push_notice(
+            "用户从右下角递话框说：%s\n"
+            "—— 先用 action=\"reply\" 回一句（他会看到你的话），"
+            "回完才能继续操作电脑；在那之前动键鼠会被拦。" % text,
+            persist=True)
+        self.msg_evt.set()
         with cu.control_bypass():
             cu.release_all()
         cu.audit("control", {"text": text[:200]}, "user_message")
         if self.control.lease and not self.control.emergency:
-            self.control.set_paused(False)
-            self.control.touch()  # 用户刚发了指令 = 有交互，续上空闲计时
-            owner = (self.control.lease or {}).get("owner") or "代理"
-            self._show_active(owner, banner_seconds=3)
+            self._show_paused()
+            self._logo(state="paused", label="待回复")
         log("用户留言：%s" % text[:120])
+
+    def _reply(self, req):
+        """agent 回答用户在递话框里说的话：把原话显示在右下角，再解除暂停。
+
+        text 允许为空：等于"我看过了，不需要回答"——同样解除暂停，但不弹回执卡，
+        只在审计里留一条记录（用户 2026-11-18 拍板）。
+        """
+        text = str(req.get("text") or "").strip()[:800]
+        with self.control_lock:
+            pending = self.pending_reply
+            if not pending:
+                raise cu.CuError("CU_BAD_ARG", "当前没有等你回答的用户消息；不用 reply")
+            self.pending_reply = None
+            self.control.pending_reply = False
+            owner = (self.control.lease or {}).get("owner") or ""
+            self.control.set_paused(False)
+            self.control.touch()
+        # 回执卡放在右下角，贴着鲸鱼：用户刚在那儿说话，回答也在那儿出现。
+        if text:
+            self.overlay.send(cmd="note", text=text, seconds=8)
+        cu.audit("control", {"text": text[:200]}, "replied" if text else "replied_silent")
+        if text:
+            self._push_notice("已回复用户：「%s」。继续工作。" % text)
+        else:
+            self._push_notice("已跳过回复（回复为空），暂停已解除，继续工作。")
+        if owner:
+            self._show_active(owner, banner_seconds=3)
+            # 送达闭环：模型已经回了话 → 绿环亮 3 秒（回执卡同时出现），
+            # 下一次操作时 _cmd 会把颜色复位。
+            self._logo(state="active", label="已回复", color="#34C759")
+        log("回复用户：%s" % (text[:120] if text else "（空，不弹窗）"))
+        return {"replied": True, "to": pending["text"][:200], "text": text, "paused": False,
+                "control": self.control.status()}
+
+    def _resume(self, req):
+        """显式恢复：只解暂停，不碰租约（agent 不该用 deactivate 来"恢复"）。"""
+        if self.control.emergency:
+            raise cu.CuError("CU_EMERGENCY_STOP", "")
+        if not self.control.lease:
+            raise cu.CuError("CU_NOT_ACTIVATED", "")
+        if self.pending_reply:
+            raise cu.CuError("CU_UNANSWERED", "")
+        if not self.control.paused:
+            return {"resumed": False, "note": "本来就没暂停"}
+        self.control.set_paused(False)
+        self.control.touch()
+        owner = (self.control.lease or {}).get("owner") or ""
+        self._show_active(owner, banner_seconds=3)
+        self._push_notice("cu 已恢复，观察屏幕并继续操作。")
+        cu.audit("control", {"why": "resume"}, "resumed")
+        return {"resumed": True, "paused": False}
+
+    def _phase(self, req):
+        """鲸鱼下方的状态字：操作中 / 思考中 / 后台执行中 / 观察中 / 等待中。
+
+        这些阶段只有 agent 侧知道（它在想还是在点），所以由客户端按调用阶段推过来。
+        """
+        if not self.control.lease or self.control.paused:
+            return {"phase": None}
+        label = str(req.get("label") or "")[:10]
+        self._phase_at = time.time()
+        self._logo(label=label)
+        return {"phase": label}
+
+    def _relay(self, req):
+        """用户留言的递送状态：sent=已送达模型（绿），failed=递送失败（红），clear=复位。"""
+        st = str(req.get("state") or "").lower()
+        if st == "sent":
+            self._logo(color="#34C759", label="已送达")
+        elif st == "failed":
+            self._logo(color="#FF3B30", label="递送失败")
+        else:
+            self._logo(color="", label="")
+        return {"relay": st or "clear"}
 
     # ---- 用户同意 ----
     def _resolve_pending(self, decision):
@@ -828,6 +980,10 @@ class Server:
     def _lease_view(self, lease):
         v = self.control.status()
         v["since"] = round(time.time() - lease["started"], 1) if lease else 0
+        v["intro"] = self.intro
+        v["intensity"] = self.intensity
+        v["intensity_label"] = INTENSITY_LABELS.get(self.intensity, "")
+        v["pending_reply"] = bool(self.pending_reply)
         return v
 
     def _activate(self, req):
@@ -839,10 +995,39 @@ class Server:
         # 身份以会话 id 为准：label 只是调用方自报的名字，容易写成"主 agent"这种废话。
         # 只有拿不到 session 时才退回 label。
         self.session = str(req.get("session") or "")[:120]
+        # 会话在客户端里显示的名字（用户可随时改），横幅优先用它。
+        self.session_title = " ".join(str(req.get("title") or "").split())[:40]
         owner_id = str(req.get("agent") or req.get("session") or "")[:120]
         owner = (self.session or str(req.get("owner") or req.get("label") or "").strip()[:80]
                  or "未命名会话")
         self.cwd = str(req.get("cwd") or "")[:260]
+
+        # 自我介绍：用户要能一眼分清"是哪个会话要动我的电脑"，所以不许拿 session id
+        # 或"主 agent"这种称呼糊弄过去。必须 agent 自己写一句话，连同使用强度一起
+        # 上报；这两样东西先上屏、用户同意之后才放开 cu。
+        intro = str(req.get("intro") or "").strip()
+        intro = " ".join(intro.split())[:60]
+        intensity = str(req.get("intensity") or "").strip().lower()
+        # 自动化测试里没人在看横幅，省掉这两样会逼着每个老用例改一遍；
+        # 生产（不设 DSH_CU_TEST）保持强制，缺了照样 CU_NEED_INTRO。
+        if os.environ.get("DSH_CU_TEST") == "1":
+            intro = intro or "自动化测试会话"
+            intensity = intensity or "unknown"
+        if len(intro) < 4:
+            raise cu.CuError("CU_NEED_INTRO",
+                             'activate 必须带 intro：用一句话写清"你是哪个会话、正在做什么"，'
+                             "例如 intro=\"课程表整理：把 Excel 里的课表抄进日历\"。"
+                             "不要写 session id 或「主 agent」。")
+        if re.fullmatch(r"[0-9a-fA-F\-:\s]{8,}", intro) or intro.lower().startswith("session"):
+            raise cu.CuError("CU_NEED_INTRO",
+                             "intro 不能是 session id 这类机器标识；请写人话，让用户知道你是谁、要做什么。")
+        if self.session and intro.replace("-", "") in self.session.replace("-", ""):
+            raise cu.CuError("CU_NEED_INTRO", "intro 不能直接抄 session id；请写人话。")
+        if intensity not in INTENSITY_LABELS:
+            raise cu.CuError("CU_NEED_INTRO",
+                             "activate 必须带 intensity，三选一：script_main（主要脚本实现，键鼠零星使用）/ "
+                             "unknown（我不知道，视情况而定）/ gui_main（主要键鼠实现，脚本零星使用）。")
+        self.intro, self.intensity = intro, intensity
         for key, attr, lo, hi in (("idle_ttl", "idle_ttl", 2, 1800),
                                   ("max_ttl", "max_ttl", 60, 28800)):
             if req.get(key) is not None:
@@ -853,7 +1038,9 @@ class Server:
         with self.control_lock:
             if self.control.emergency:
                 raise cu.CuError("CU_EMERGENCY_STOP",
-                                 "用户手动关闭了电脑控制；先请用户再按一次 Ctrl+Alt+Shift+Backspace 解除")
+                                 "用户手动关闭了电脑控制，这一轮的 cu 正在退出。"
+                                 "不要重试、不要让用户再按任何键（再按只会立刻关掉，不是解锁）；"
+                                 "要重新开始必须重新 activate 并等用户同意")
             L = self.control.lease
             if L:
                 if L["owner"] == owner:
@@ -861,6 +1048,9 @@ class Server:
                 raise cu.CuError("CU_BUSY", "正在使用：%s" % L["owner"])
             if self.pending:
                 raise cu.CuError("CU_BUSY", "正在等待用户授权：%s" % self.pending["owner"])
+            # 真正要授予新租约了：把上一轮留下的留言/提示全部作废，再放行。
+            # 进程可能是复用的，不能指望"重启才干净"。
+            self._purge_carryover()
             if self.consent_mode == "auto":
                 lease = self.control.grant(owner, owner_id)
                 self._show_active(owner)
@@ -872,7 +1062,7 @@ class Server:
         t0 = time.time()
         ok = self.overlay.send(
             cmd="banner",
-            text=("会话 %s 想接管鼠标和键盘" % self.session) if self.session else "有 agent 想接管鼠标和键盘",
+            text=("「%s」想接管鼠标和键盘" % self.intro) if self.intro else "有 agent 想接管鼠标和键盘",
             sub=self._session_line(),
             note="同意后它会操作这台电脑；完成后自动交还，空闲 %d 分钟也会收回。"
                  % max(1, int(self.control.idle_ttl // 60)),
@@ -899,8 +1089,16 @@ class Server:
 
     def _deactivate(self, req):
         reason = str(req.get("reason") or "agent 完成")[:160]
+        if self.pending_reply:
+            # 用户说了话还在等答复：不许用"收工"逃走，先把话回完（空 reply 也算回）。
+            raise cu.CuError("CU_UNANSWERED", "")
         with self.control_lock:
             L = self.control.revoke(reason)
+        # 防积压（第一道）：交还即清空这一轮的留言/提示，留到下一轮就是脏数据。
+        self._purge_carryover()
+        if L:
+            self.revoke_reason = "turn-end" if reason == "turn-end" else "deactivate"
+            self.revoke_detail = _STOP_DETAIL.get(self.revoke_reason, reason)
         if not L:
             return {"deactivated": False, "note": "本来就没有激活，无需关闭"}
         with cu.control_bypass():
@@ -1177,18 +1375,55 @@ class Server:
         return list(self.notices)
 
     # ---- 给"唤醒沉睡会话"用的留言队列 ----
+    CLAIM_TTL = 45.0
+
+    def _claim_msgs(self, ids=None):
+        """认领待投递留言：同一时刻只有一个消费者拿得到。
+
+        工具体 hold 与宿主 relay 读的是同一个队列。原来两边各自读、各自 ack，
+        同一条留言可能既进了工具结果、又被 followup 投一遍；现在先到先得，
+        认领后 45 秒内没人 ack 才放回队列（at-least-once，但不重复）。
+        """
+        now = time.time()
+        for mid, ent in list(self.inflight.items()):
+            if now - ent["at"] > self.CLAIM_TTL:
+                self.inflight.pop(mid, None)
+                self.user_msgs.append(ent["item"])
+        self.user_msgs.sort(key=lambda m: m.get("id") or 0)
+        if ids is not None:
+            want = set()
+            for x in ids:
+                try:
+                    want.add(int(x))
+                except (TypeError, ValueError):
+                    pass
+            take = [m for m in self.user_msgs if m["id"] in want]
+        else:
+            take = list(self.user_msgs)
+        if take:
+            taken = {m["id"] for m in take}
+            self.user_msgs = [m for m in self.user_msgs if m["id"] not in taken]
+            for m in take:
+                self.inflight[m["id"]] = {"item": m, "at": now}
+        return take
+
     def _messages(self, req):
         """留言队列。Node 侧轮询它，把留言塞进会话把模型叫醒。
 
         提示（notice）只在有工具调用时才随结果送到模型面前；会话睡着时
         一次工具调用都没有，留言就永远递不进去。所以另开一条通道：
         宿主侧拿到 items 后用 agent.followup() 直接唤醒会话。
+        claim=true 表示"认领"：拿到的同时从队列挪进 inflight，别家就拿不到了。
         """
         ack = req.get("ack")
         if ack:
             ids = {int(x) for x in ack if str(x).isdigit()}
             self.user_msgs = [m for m in self.user_msgs if m["id"] not in ids]
+            for i in ids:
+                self.inflight.pop(i, None)
             return {"acked": len(ids), "items": []}
+        if req.get("claim"):
+            return {"items": self._claim_msgs(req.get("ids"))}
         return {"items": list(self.user_msgs)}
 
     def _wait(self, req):
@@ -1209,13 +1444,22 @@ class Server:
             if self.stopping or self.user_msgs:
                 break
             self.msg_evt.wait(0.2)
-        items = list(self.user_msgs)
+        items = self._claim_msgs()
         lease = self.control.lease or {}
+        if self.stopping:
+            why, detail = self.stop_reason, self.stop_detail
+        elif not lease and self.revoke_reason:
+            why, detail = self.revoke_reason, self.revoke_detail
+        else:
+            why, detail = "", ""
         return {
             "items": items,
             "active": bool(lease),
             "paused": bool(self.control.paused),
+            "pending_reply": bool(self.pending_reply),
             "closed": bool(self.stopping),
+            "reason": why,
+            "detail": detail,
             "owner": lease.get("owner") or "",
             "seconds": round(seconds, 1),
         }
@@ -1239,74 +1483,43 @@ class Server:
         self.inbox = [n for n in self.inbox if n.get("id") not in ids]
         self._inbox_save()
 
-    def _stop_marker_path(self):
-        return os.path.join(_home_dir(), "last_stop.json")
+    def _purge_carryover(self):
+        """新一轮接管前清空上一轮的一切残留。
 
-    def _write_stop_marker(self, reason):
+        用户 2026-11-20 要求：一轮新 cu 打开时，上一轮发生了什么都不能影响它。
+        所以留言队列、已认领未 ack 的、待回复、待推提示、落盘 inbox 全清。
+        """
         try:
-            with open(self._stop_marker_path(), "w", encoding="utf-8") as f:
-                json.dump({"reason": reason, "at": time.time()}, f)
-        except OSError as e:
-            log("写 last_stop.json 失败：%s" % e)
-
-    def _seed_stop_notice(self):
-        """新实例起来时，把上一次"为什么关掉"告诉 agent，免得它莫名其妙重试。"""
-        try:
-            with open(self._stop_marker_path(), encoding="utf-8") as f:
-                m = json.load(f)
-        except (OSError, ValueError):
-            return
-        try:
-            age = time.time() - float(m.get("at") or 0)
-        except (TypeError, ValueError):
-            return
-        if age < 0 or age > 3600:
-            return
-        why = m.get("reason")
-        if why == "emergency":
-            self._push_notice(
-                "【用户手动关闭】上一次操作时用户手动关闭了电脑控制，服务已完全退出。"
-                "请立刻停手，不要重试原动作、不要绕过。需要再操作电脑时重新 activate，"
-                "并等用户点同意。")
-        elif why == "deactivate":
-            self._push_notice(
-                "【电脑控制已关闭】上次交还后 cu 已退出；现在是新的实例、还没有控制权。"
-                "要操作电脑请先 activate 并等用户同意。")
-        elif why == "turn-end":
-            self._push_notice(
-                "【电脑控制已被强制关闭】上一回合你在还握着控制权的时候就结束了，"
-                "宿主替你交还并关掉了 cu（不允许把控制权跨回合留着）。"
-                "要再操作电脑请重新 activate；这条规则是硬的，下次同样会关。")
+            with self.control_lock:
+                self.pending_reply = None
+                self.control.pending_reply = False
+                self.inflight.clear()
+                self.user_msgs = []
+                self.notices = []
+            self.inbox = []
+            self._inbox_save()
+            self.stop_reason = self.stop_detail = ""
+            self.revoke_reason = self.revoke_detail = ""
+            log("新一轮接管：已清空上一轮遗留的留言/提示")
+        except Exception as e:                     # noqa: BLE001
+            log("清理上一轮遗留失败（不致命）：%s" % e)
 
     def _full_stop(self, reason="stop"):
         """彻底关掉 cu：撤提示层、带走凝视子进程、放掉监听管道，进程随之退出。"""
         if self.stopping:
             return
         self.stopping = True
-        # cu 结束 = 这一轮的指令作废：不让上一轮的留言积压到下一次 activate，
-        # 否则新会话一上来就被旧任务的话干扰（用户 2026-11-15 要求）。
-        try:
-            if self.user_msgs:
-                log("清空未送达的留言 %d 条（%s）" % (len(self.user_msgs), reason))
-            self.user_msgs = []
-            # 落盘的那份也要一起清，否则下次启动会把旧指令重新捡起来。
-            # 只清"用户留言"这一类（inbox 里只存 persist=True 的提示），
-            # 系统自己的停机说明不在此列，留着无妨。
-            keep = [n for n in self.inbox if "用户" not in str(n.get("text", ""))[:24]]
-            if len(keep) != len(self.inbox):
-                self.inbox = keep
-                self._inbox_save()
-                self.notices = [n for n in self.notices
-                                if "用户" not in str(n.get("text", ""))[:24]]
-        except Exception:
-            pass
+        self.stop_reason = reason
+        self.stop_detail = _STOP_DETAIL.get(reason, "cu 已关闭")
+        # 防积压（第二道，与 activate 的清理互为冗余）：彻底关闭时全部清空并按盘清掉，
+        # 下次启动绝不会把上一轮的东西捡回来。
+        self._purge_carryover()
         # 唤醒所有在 `wait` 里长轮询的调用方：cu 已经关了，别再等
         try:
             self.msg_evt.set()
         except Exception:
             pass
         log("彻底关闭 cu（%s）" % reason)
-        self._write_stop_marker(reason)
         try:
             self._kill_watchers()
         finally:
@@ -1329,8 +1542,15 @@ class Server:
                 return
             self.control.set_paused(False)
             lease = self.control.trip_emergency()
+            self.revoke_reason = "emergency"
+            self.revoke_detail = _STOP_DETAIL["emergency"]
         with cu.control_bypass():
             cu.release_all()
+        # 防积压（第一道）：只要控制权被收回，就把这一轮的留言/提示清干净。
+        self._purge_carryover()
+        # _purge 会清掉"为什么关"的记账；急停要把它写回去，wait 才能如实回报。
+        self.revoke_reason = "emergency"
+        self.revoke_detail = _STOP_DETAIL["emergency"]
         cu.audit("control", {"owner": (lease or {}).get("owner")}, "emergency")
         self.overlay.send(cmd="halo", on=False)
         self.overlay.send(cmd="logo", on=False)
@@ -1363,11 +1583,34 @@ class Server:
                             expired = "空闲超过 %d 秒" % int(self.control.idle_ttl)
                         if expired:
                             self.control.revoke("expired")
+                            self.revoke_reason = ("max-ttl" if expired.startswith("单次激活")
+                                                  else "idle-timeout")
+                            self.revoke_detail = expired + "，控制权已收回"
+                    # 阶段字防卡死：动作结束后偶尔没来得及推"思考中"，右下角会停在
+                    # "等待中"看着像死机。75 秒没有新阶段就退回默认状态字。
+                    if L and not self.control.paused and not expired \
+                            and self._logo_label in ("操作中", "思考中", "等待中", "观察中",
+                                                     "提问中", "后台执行中", "申请中") \
+                            and time.time() - self._phase_at > 75:
+                        self._logo(state="active", label="")
+                        self._phase_at = time.time()
                     if expired:
                         with cu.control_bypass():
                             cu.release_all()
+                        # 防积压（第一道）：超时收权同样清空这一轮的残留。
+                        # 先记住"有没有没答的话"，清空后还要用它决定鲸鱼环的颜色。
+                        had_pending = bool(self.pending_reply)
+                        self._purge_carryover()
+                        self.revoke_reason = ("max-ttl" if expired.startswith("单次激活")
+                                              else "idle-timeout")
+                        self.revoke_detail = expired + "，控制权已收回"
                         cu.audit("control", {"reason": expired}, "expired")
-                        self._show_idle()
+                        # 有留言还没答就被收权：把鲸鱼环变红并停 2.5 秒，用户能看出没送达。
+                        if had_pending:
+                            self._logo(state="paused", label="未送达", color="#FF3B30")
+                            self._later(2.5, self._show_idle)
+                        else:
+                            self._show_idle()
                         log("控制权自动收回：%s" % expired)
                         # 硬保证：agent 不主动交还也不能让 cu 一直挂着。
                         # 空闲/超时到期即整个退出（提示层一起撤），和手动关闭同一条路径。
@@ -1503,6 +1746,14 @@ class Server:
                 send_json(conn, self._wrap(rid, self._deactivate(req), t0))
             elif op == "ask":
                 send_json(conn, self._wrap(rid, self._ask(req), t0))
+            elif op == "reply":
+                send_json(conn, self._wrap(rid, self._reply(req), t0))
+            elif op == "resume":
+                send_json(conn, self._wrap(rid, self._resume(req), t0))
+            elif op == "phase":
+                send_json(conn, self._wrap(rid, self._phase(req), t0, with_notice=False))
+            elif op == "relay":
+                send_json(conn, self._wrap(rid, self._relay(req), t0, with_notice=False))
             elif op == "control":
                 send_json(conn, self._wrap(rid, self._control(req), t0))
             elif op == "messages":
@@ -1567,6 +1818,15 @@ class Server:
                 # 一次把攒下的都带上：一条一送会被"队首没 ack"堵住后面的
                 out["notice"] = "\n".join(n["text"] for n in pend)
                 out["notice_ids"] = [n["id"] for n in pend]
+            # 欠着用户一句答复时，每次结果都提醒（这是硬闸：不 reply 就一直动不了键鼠，
+            # 也不许 deactivate 收工）。用户 2026-11-18 明确要求"先答再干"。
+            if self.pending_reply:
+                owe = ("【待回复】用户刚在右下角给你留了话，你还没回。用 action=\"reply\" "
+                       "回一句（他会看到）；觉得不必回就 reply 空字符串照样解除暂停。"
+                       "**reply 一返回，暂停就自动解除了**，不要再对用户说\"你还处于暂停\""
+                       "或让他手动恢复。在 reply 之前：动键鼠会被 CU_UNANSWERED 拦，"
+                       "deactivate 也走不了。")
+                out["notice"] = (out.get("notice") + "\n\n" + owe) if out.get("notice") else owe
         return out
 
     def _ping(self):
@@ -1614,6 +1874,9 @@ class Server:
         return "参数不合法：%s（输入：%s）" % (text or "见各子命令 --help", src)
 
     def _cmd(self, req):
+        # 用户下一次动手操作 = 上一条"递送失败"的红环该复位了。
+        if self._logo_color:
+            self._logo(color="", label="")
         argv = req.get("argv")
         line = req.get("line")
         if argv is None and line is not None:
@@ -1723,7 +1986,12 @@ class Server:
         a.region = req.get("region")
         a.long = req.get("long")
         a.full = bool(req.get("full"))
+        a.grid = req.get("grid") is not False
         png, meta = cu.capture_shot(a)
+        if req.get("settle") and cu._settle_screen():
+            # 首张正撞上动画/过渡：等落定后重截一张
+            png, meta = cu.capture_shot(a)
+            meta["settled"] = True
         vx, vy, vw, vh = cu.screen()
         meta["screen"] = {"x": vx, "y": vy, "width": vw, "height": vh}
         if meta.get("region"):
