@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """cu.py 的契约测试（不靠"数数量"，只钉行为语义）。
 
 跑：`python tests/test_contracts.py`
@@ -20,6 +20,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PYDIR = os.path.join(HERE, "..", "python")
@@ -344,16 +345,73 @@ def main():
         _aa.long = 480
         _aa.full = False
         try:
+            # 默认：截"屏幕真实显示"（会被上层窗口挡住）
             png2, meta2 = cu.capture_shot(_aa)
             cu._validate_png(png2, meta2["width"], meta2["height"])
-            check("窗口截图走双后端且 PNG 合规",
-                  meta2.get("capture_path") in ("printwindow", "gdi")
+            check("窗口截图默认截屏幕真实画面",
+                  meta2.get("capture_path") in ("screen", "gdi")
                   and max(meta2["width"], meta2["height"]) <= 480,
                   (meta2.get("capture_path"), meta2["width"], meta2["height"]))
+            # 显式要窗口本体才走 PrintWindow
+            _aa.window_only = True
+            png3, meta3 = cu.capture_shot(_aa)
+            cu._validate_png(png3, meta3["width"], meta3["height"])
+            check("window_only 才截窗口本体",
+                  meta3.get("capture_path") in ("printwindow", "gdi"),
+                  meta3.get("capture_path"))
         except cu.CuError as e:
-            check("窗口截图走双后端且 PNG 合规", False, e)
-    else:
-        check("窗口截图走双后端且 PNG 合规", True, "（没有可用窗口，跳过）")
+            check("窗口截图默认截屏幕真实画面", False, e)
+
+    # G7 窗口栈：Z 序、前台标记、矩形
+    rows = cu.window_stack()
+    check("窗口栈非空且 z 单调", bool(rows) and [r["z"] for r in rows] == list(range(len(rows))),
+          len(rows))
+    fg = cu.foreground_window()
+    if fg is not None:
+        check("窗口栈标出了前台窗口",
+              any(r["foreground"] for r in rows) or not rows, fg.title[:30])
+    check("窗口栈不含本插件提示层",
+          all(not (r["title"] or "").startswith("cu-") for r in rows),
+          [r["title"] for r in rows[:3]])
+    if rows:
+        r0 = rows[0]
+        check("窗口栈每行都有矩形/全屏/最小化字段",
+              len(r0["rect"]) == 4 and isinstance(r0["fullscreen"], bool)
+              and isinstance(r0["minimized"], bool), r0)
+
+    # G8 wait-for：能等到，也能超时（超时必须是 CU_TIMEOUT，不是傻等）
+    t0 = time.time()
+    out = cu.wait_for(type("_W", (), {"window": "DeepSeek", "text": None,
+                                      "stable": False, "timeout": 3,
+                                      "interval": 0.2, "as_json": False})())
+    check("wait-for 等到窗口", bool(out) and "窗口" in out[0], out)
+    check("wait-for 很快返回", time.time() - t0 < 3, time.time() - t0)
+    ok_wait, code_wait = expect_code(
+        lambda: cu.wait_for(type("_W", (), {"window": "绝对不存在的窗口-xyzzy",
+                                            "text": None, "stable": False,
+                                            "timeout": 0.5, "interval": 0.2,
+                                            "as_json": False})()),
+        "CU_TIMEOUT")
+    check("wait-for 超时给 CU_TIMEOUT", ok_wait, code_wait)
+
+    # G9 zoom：以某点为中心裁一块并放大；网格标的是整屏归一化坐标
+    a = type("_A", (), {"window": None, "region": None, "long": None, "full": False,
+                        "grid": True, "settle": False, "window_only": False,
+                        "at": "500,500", "span": 200, "out": None})()
+    png, meta = cu.capture_shot(a)
+    zoom = meta.get("zoom") or {}
+    check("zoom 带中心/范围/边界",
+          zoom.get("center") == [500.0, 500.0] and zoom.get("span") == 200
+          and len(zoom.get("bounds") or []) == 4, zoom)
+    b = zoom.get("bounds") or [0, 0, 0, 0]
+    check("zoom 边界在 0..1000", 0 <= b[0] < b[2] <= 1000 and 0 <= b[1] < b[3] <= 1000, b)
+    check("zoom 确实放大了（长边到预算）", max(meta["width"], meta["height"]) >= 1200, meta)
+    bad, code = expect_code(
+        lambda: cu.capture_shot(type("_A", (), {"window": None, "region": None, "long": None,
+                                                "full": False, "grid": True, "settle": False,
+                                                "window_only": False, "at": "abc", "span": 200})()),
+        "CU_BAD_ARG")
+    check("zoom 的 at 写错要拒绝", bad, code)
 
     print()
     print("cu.py 契约: %s（%d 通过 / %d 失败）"

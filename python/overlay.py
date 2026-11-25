@@ -622,11 +622,6 @@ def _rgb(s):
         return STATUS_ACTIVE
 
 
-def _darken(color, k: float):
-    """按比例调暗，给浅色底上的同色文字用（ImageDraw 不做 alpha 混合）。"""
-    return (max(0, int(color[0] * k)), max(0, int(color[1] * k)), max(0, int(color[2] * k)))
-
-
 def panel_image(content: Image.Image, radius: int, shadow: int = 18):
     """给内容图加圆角、1px 描边和柔和投影，返回更大的 RGBA 图。
 
@@ -792,7 +787,7 @@ def _whale_source():
 _WHALE = None
 
 
-def _logo_core(d: int, color, state: str = "active", label: str = None):
+def _logo_core(d: int, color, state: str = "active", label: str = None, sweep=None):
     """logo 静态部分：白底圆盘 + 官方鲸鱼（黑），下方一行状态字。
 
     状态字是用户要求的"一眼看出它在干活还是停了"：控制中=蓝，已暂停=灰蓝。
@@ -845,16 +840,52 @@ def _logo_core(d: int, color, state: str = "active", label: str = None):
     tx = int((cw - tw) / 2)
     ty = d + int(label_h * 0.34)
     td = ImageDraw.Draw(base)
-    # 深色胶囊 + 白字：白描边在深色壁纸/浅色窗口上都糊成一团（用户反馈「白边难辨认」），
-    # 改成给文字一块实心底，任何底色上都读得清。
-    px, py = int(d * 0.10), int(d * 0.05)
-    td.rounded_rectangle((tx - px, ty - py, tx + tw + px, ty + glyph_h + py),
-                         radius=int(glyph_h * 0.55), fill=(18, 20, 26, 214))
-    td.text((tx, ty - int(glyph_h * 0.12)), text, font=font, fill=(255, 255, 255, 250))
+    # 文字周围保持干净：不画胶囊底、不描边。之前那块深色胶囊在浅色壁纸上就是
+    # 用户看到的"深色椭圆印记"。字用近白，光泽只沿笔划走。
+    td.text((tx, ty - int(glyph_h * 0.12)), text, font=font, fill=(238, 242, 250, 252))
+    if sweep is not None:
+        _sweep_text(base, text, font, tx, ty - int(glyph_h * 0.12), phase=sweep)
     return base, (cw, total_h), total_h
 
 
-def logo_frames(d: int, color, state: str = "active", n: int = 24, label: str = None):
+def _sweep_text(base, text, font, tx, ty, phase, tilt_deg=20.0):
+    """在**文字笔划内部**扫一道带 20° 倾角的浅色光束。
+
+    用户要的是"字本身亮起来"，不是给胶囊底打光：所以光束先做成一条倾斜的
+    渐变带，再乘文字 alpha 掩膜——胶囊底、空白处一点都不会亮，光带只沿着
+    "操作中"这三个字的笔划流动，并且带倾角跨字。
+    """
+    w, h = base.size
+    mask = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(mask).text((tx, ty), text, font=font, fill=255)
+    box = mask.getbbox()
+    if not box:
+        return
+    x0, y0, x1, y1 = box
+    span = x1 - x0
+    bw = max(6, int(span * 0.55))
+    mid_y = (y0 + y1) / 2.0
+    slope = math.tan(math.radians(tilt_deg))
+    left = x0 - bw + phase * (span + 2 * bw)
+    band = Image.new("L", (w, h), 0)
+    bd = ImageDraw.Draw(band)
+    for y in range(y0, y1):
+        cx = left + slope * (y - mid_y)
+        for i in range(bw):
+            k = 1.0 - abs(i - bw / 2.0) / (bw / 2.0)
+            if k <= 0:
+                continue
+            x = int(cx) + i
+            if 0 <= x < w:
+                bd.point((x, y), fill=int(255 * (k ** 1.4)))
+    glow = Image.new("RGBA", (w, h), (150, 200, 255, 255))
+    alpha = ImageChops.multiply(band, mask)
+    glow.putalpha(alpha)
+    base.alpha_composite(glow)
+
+
+def logo_frames(d: int, color, state: str = "active", n: int = 24, label: str = None,
+                sweep_on: bool = True):
     """呼吸帧：静态核心 + 每帧两层柔光环。
 
     光环的外半径会超出圆盘，如果画在 d×d 画布上，环会被边缘切出直线（实拍里那道
@@ -868,6 +899,11 @@ def logo_frames(d: int, color, state: str = "active", n: int = 24, label: str = 
     disc_c = d / 2.0                         # 圆盘半径（相对 d）
     out = []
     for i in range(n):
+        # 状态词光束：2.5 秒一个周期，前 0.5 秒扫过文字（用户要求：单特效 0.5s）
+        t = (i / float(n)) * BREATH_SECONDS
+        ph = (t % 2.5) / 2.5
+        sweep = (ph / 0.2) if (sweep_on and ph < 0.2) else None
+        core_i = _logo_core(d, color, state, label, sweep=sweep)[0] if sweep is not None else core
         pulse = 0.5 + 0.5 * math.sin((i / n) * math.tau)
         ring = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         rd = ImageDraw.Draw(ring)
@@ -879,7 +915,7 @@ def logo_frames(d: int, color, state: str = "active", n: int = 24, label: str = 
         ring = ring.filter(ImageFilter.GaussianBlur(d * 0.012))
         img = Image.new("RGBA", (cw, ch), (0, 0, 0, 0))
         img.alpha_composite(ring)
-        img.alpha_composite(core, (pad, pad))
+        img.alpha_composite(core_i, (pad, pad))
         out.append(img)
     return out
 
@@ -939,6 +975,7 @@ class Renderer(threading.Thread):
         self.logo_state = "active"
         self.logo_label = None      # 覆盖状态字（操作中/思考中/后台执行中…）
         self.logo_color = None      # 覆盖呼吸环颜色（留言送达=绿、失败=红）
+        self.logo_sweep = True      # 只有"正在有序运行"时才让光泽扫过状态字
         self.banner = None          # dict(text/sub/note/seconds/buttons/tone/deadline)
         # 鲸鱼旁边的小回执卡：agent 用 reply 回答过用户之后，把自己的话说一遍给用户看。
         # 顶部横幅只留给"启动申请 / 关闭提示"，所以回执走右下角，跟鲸鱼同一个角落。
@@ -958,6 +995,7 @@ class Renderer(threading.Thread):
         self._halo_idx = -1
         self._logo_frames = None
         self._logo_key = None
+        self._logo_cache = {}
         self._logo_d = 0
         self._logo_phase = 0.0
         # 呼吸节奏按"时间"走，不按帧数：这台机是 240Hz，按帧推进会让鲸鱼每 0.1 秒
@@ -1026,8 +1064,11 @@ class Renderer(threading.Thread):
                 label = cmd.get("label")
                 label = str(label)[:12] if label else None
                 col = _rgb(cmd["color"]) if cmd.get("color") else None
-                if (st, label, col) != (self.logo_state, self.logo_label, self.logo_color):
+                sw = bool(cmd.get("sweep", True))
+                if (st, label, col, sw) != (self.logo_state, self.logo_label,
+                                            self.logo_color, self.logo_sweep):
                     self.logo_state, self.logo_label, self.logo_color = st, label, col
+                    self.logo_sweep = sw
                     self._logo_frames = None      # 换状态/字/环色都要重画
             elif k == "banner":
                 self.banner = {
@@ -1234,10 +1275,19 @@ class Renderer(threading.Thread):
             d = int(62 * ls)
             lcolor = self.logo_color or (STATUS_FAIL if self.logo_state == "failed" else
                                          PAUSED_INK if self.logo_state == "paused" else STATUS_ACTIVE)
-            lkey = (d, lcolor, self.logo_state, self.logo_label)
+            # 光泽只在"正在有序运行"时出现：暂停/待命/卡死都不扫，用户一眼能分出
+            # "它在动"和"它停着"。
+            sweep_on = bool(self.logo_sweep) and self.logo_state == "active"
+            lkey = (d, lcolor, self.logo_state, self.logo_label, sweep_on)
             if self._logo_frames is None or self._logo_key != lkey:
-                self._logo_frames = logo_frames(d, lcolor, self.logo_state,
-                                                label=self.logo_label)
+                cached = self._logo_cache.get(lkey)
+                if cached is None:
+                    cached = logo_frames(d, lcolor, self.logo_state,
+                                         label=self.logo_label, sweep_on=sweep_on)
+                    if len(self._logo_cache) > 6:
+                        self._logo_cache.clear()
+                    self._logo_cache[lkey] = cached
+                self._logo_frames = cached
                 self._logo_key = lkey
                 self._logo_d = d
                 self._logo_idx = -1

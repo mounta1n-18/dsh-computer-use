@@ -18,8 +18,10 @@ def sig_probe(rc, out, err):
     keys = [k for k in ("屏幕", "完整性", "Pillow", "剪贴板", "光标", "可见窗口", "可输入桌面") if k in out]
     return "%d|%s" % (rc, ",".join(keys))
 def sig_windows(rc, out, err):
-    head = out.splitlines()[0] if out.strip() else ""
-    return "%d|cols=%d" % (rc, head.count(" ") > 0 and len(re.findall(r"\s+", head)) or 0)
+    # 第一行是说明，表头才是契约形状（2026-11-23 改成 Z 序表）
+    lines = out.splitlines()
+    head = next((ln for ln in lines if "hwnd" in ln), lines[0] if lines else "")
+    return "%d|cols=%d" % (rc, len(re.findall(r"\s+", head.strip())) + (1 if head.strip() else 0))
 def sig_rect(rc, out, err):
     # 只看契约，不看环境：找不到窗口必须是 CU_NO_WINDOW；找到了必须给坐标。
     both = out + err

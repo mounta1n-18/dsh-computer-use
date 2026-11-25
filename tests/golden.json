@@ -1,7 +1,7 @@
 {
  "where": "0|光标",
  "probe": "0|屏幕,完整性,Pillow,剪贴板,光标,可见窗口,可输入桌面",
- "windows": "0|cols=3",
+ "windows": "0|cols=8",
  "rect-no-window": "2|no-window",
  "shot-region": "0|shot",
  "key-shift": "0|已按",

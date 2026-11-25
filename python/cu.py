@@ -12,7 +12,7 @@ cu.py — 看屏幕、动鼠标、敲键盘、开应用、管窗口。
     支持小数；本机 2560 宽屏下 0.01 单位 = 0.026px，精度绰绰有余。
 
 常用：
-    python cu.py shot                       # 截图（默认缩到长边 1280）
+    python cu.py shot                       # 截图（默认缩到长边 1600）
     python cu.py shot --region 0,0,640,360  # 只截左上 640x360（长边≤1568 时 1:1），看小字用
     python cu.py click 500 500              # 点屏幕正中
     python cu.py apps 计算器                 # 找应用（Get-StartApps 目录）
@@ -137,8 +137,9 @@ class Control:
         self.lease = None
         self._bypass = 0
         self._lock = threading.RLock()
-        self.idle_ttl = _env_float("DSH_CU_IDLE_TTL", 120.0)
-        self.max_ttl = _env_float("DSH_CU_MAX_TTL", 1800.0)
+        self.idle_ttl = _env_float("DSH_CU_IDLE_TTL", 300.0)
+        # 0 = 不设绝对上限。自动收权只看"多久没有任何操作"，不看"从激活起过了多久"。
+        self.max_ttl = _env_float("DSH_CU_MAX_TTL", 0.0)
         self.pending = None          # 正在等用户同意的请求（仅服务端用）
         self.paused = False          # 用户按了暂停键：保留租约，但停止一切注入
         self.paused_at = 0.0
@@ -165,7 +166,10 @@ class Control:
             left_idle = left_max = 0
             if L:
                 left_idle = max(0, int(round(L["last"] + self.idle_ttl - now)))
-                left_max = max(0, int(round(L["max_deadline"] - now)))
+                if self.max_ttl > 0:
+                    left_max = max(0, int(round(L["max_deadline"] - now)))
+                else:
+                    left_max = -1          # -1 = 没有绝对上限
             return {
                 "enabled": self.enabled,
                 "emergency": self.emergency,
@@ -210,7 +214,7 @@ class Control:
                 self.lease = None
                 raise CuError("CU_LEASE_EXPIRED",
                               "空闲超过 %d 秒" % int(self.idle_ttl))
-            if now > L["max_deadline"]:
+            if self.max_ttl > 0 and now > L["max_deadline"]:
                 self.lease = None
                 raise CuError("CU_LEASE_EXPIRED",
                               "单次激活超过 %d 秒上限" % int(self.max_ttl))
@@ -369,40 +373,6 @@ def audit_tail(n=20):
 # ---------------------------------------------------------------- 结果信封
 # 对齐豆包 agent_infra 的那套严格校验：缺 ok / output.type 未知 / 失败却没带
 # error 对象，一律当协议错误。宁可报错，也不要把半成品当结果喂给模型。
-def envelope_ok(text=None, image=None, error=None):
-    """构造一份结果信封并做严格自检；不合规直接抛 CU_PROTOCOL。"""
-    env = {"ok": error is None}
-    if error is not None:
-        env["error"] = {"code": getattr(error, "code", "CU_UNEXPECTED"),
-                        "message": str(error)}
-    if image is not None:
-        env["output"] = {"type": "image", "image": image}
-    elif text is not None:
-        env["output"] = {"type": "text", "text": text}
-    else:
-        env["output"] = {"type": "none"}
-    _check_envelope(env)
-    return env
-
-
-def _check_envelope(env):
-    if not isinstance(env, dict):
-        raise CuError("CU_PROTOCOL", "结果信封不是对象")
-    if "ok" not in env or not isinstance(env["ok"], bool):
-        raise CuError("CU_PROTOCOL", "结果信封缺少布尔型 ok 字段")
-    out = env.get("output")
-    if out is not None:
-        if not isinstance(out, dict) or "type" not in out:
-            raise CuError("CU_PROTOCOL", "output 缺少 type 字段")
-        if out["type"] not in ("text", "image", "none"):
-            raise CuError("CU_PROTOCOL", "output.type 未知：%r" % (out["type"],))
-    if env["ok"] is False:
-        err = env.get("error")
-        if not isinstance(err, dict) or not err.get("code") or not err.get("message"):
-            raise CuError("CU_PROTOCOL", "失败信封缺少合规的 error 对象")
-    return env
-
-
 # ---------------------------------------------------------------- Win32 基础
 u32 = ctypes.WinDLL("user32", use_last_error=True)
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -615,24 +585,17 @@ def _glide(x, y, ms=None):
 
 
 def _move_smooth(nx, ny, ms=300):
-    """平滑移动光标（对齐豆包 mouse.move_smooth）。
+    """平滑移动光标（对齐豆包 mouse.move_smooth 的老接口）。
 
     为什么需要它：目标应用常按 MOUSEMOVE 的**连续性**判断"这是人在移动鼠标"——
     hover 菜单、拖拽手柄、自动隐藏工具栏都吃这一套。瞬移会让它们收不到中间事件，
-    表现成"悬停没反应"。和 drag 里那段"不是瞬移"的注释是同一个道理。
+    表现成"悬停没反应"。位移本身交给 `_glide`，这里只做参数校验和坐标换算，
+    不再维护第二套插值循环。
     """
     if not 0 <= ms <= 5000:
         raise CuError("CU_BAD_ARG", "平滑移动时长需在 0..5000 毫秒，收到 %s" % ms)
-    x0, y0 = where()
     x1, y1 = to_px(nx, ny)
-    dist = max(abs(x1 - x0), abs(y1 - y0))
-    steps = 1 if ms <= 0 else max(2, min(60, dist // 12 or 2))
-    pause = (ms / 1000.0) / steps if ms > 0 else 0
-    for i in range(1, steps + 1):
-        e = _ease(i / float(steps))
-        move(int(round(x0 + (x1 - x0) * e)), int(round(y0 + (y1 - y0) * e)))
-        if pause:
-            time.sleep(pause)
+    _glide(x1, y1, max(1, int(ms)))
     return x1, y1
 
 
@@ -1332,8 +1295,200 @@ def window_rect(hwnd):
     return r.left, r.top, r.right - r.left, r.bottom - r.top
 
 
+def frame_rect(hwnd):
+    """可见边框矩形（不含 DWM 阴影），并夹在虚拟屏幕内。
+
+    GetWindowRect 会带上不可见的阴影边（最大化时常见 -11,-11），
+    直接拿去裁屏幕会带一圈屏幕外的黑边、归一化坐标也会变成负数。
+    """
+    r = wintypes.RECT()
+    ok = False
+    try:
+        dwm = ctypes.windll.dwmapi
+        ok = dwm.DwmGetWindowAttribute(wintypes.HWND(hwnd), 9,  # DWMWA_EXTENDED_FRAME_BOUNDS
+                                       ctypes.byref(r), ctypes.sizeof(r)) == 0
+    except Exception:                                              # noqa: BLE001
+        ok = False
+    if not ok or r.right <= r.left or r.bottom <= r.top:
+        x, y, w, h = window_rect(hwnd)
+    else:
+        x, y, w, h = r.left, r.top, r.right - r.left, r.bottom - r.top
+    vx, vy, vw, vh = screen()
+    x0, y0 = max(vx, x), max(vy, y)
+    x1, y1 = min(vx + vw, x + w), min(vy + vh, y + h)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return window_rect(hwnd)
+    return x0, y0, x1 - x0, y1 - y0
+
+
 def find_windows(pattern):
     return [w for w in enum_windows() if w.match(pattern)]
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD),
+                ("rcMonitor", wintypes.RECT),
+                ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD)]
+
+
+def monitors():
+    """每台显示器的物理矩形 (x, y, w, h, 是否主屏)。"""
+    out = []
+    CB = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC,
+                            ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+    def cb(hmon, _hdc, _rc, _):
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if u32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            r = info.rcMonitor
+            out.append((r.left, r.top, r.right - r.left, r.bottom - r.top,
+                        bool(info.dwFlags & 1)))
+        return True
+
+    u32.EnumDisplayMonitors(None, None, CB(cb), 0)
+    return out
+
+
+def _pid_of(hwnd):
+    p = wintypes.DWORD()
+    u32.GetWindowThreadProcessId(hwnd, ctypes.byref(p))
+    return p.value
+
+
+def foreground_window():
+    h = u32.GetForegroundWindow()
+    return next((w for w in enum_windows() if w.hwnd == h), None)
+
+
+def wait_for(a):
+    """等服务端条件成立——模型不用自己 sleep+反复截图，一个调用顶一串回合。"""
+    t0 = time.time()
+    timeout = max(0.5, float(getattr(a, "timeout", 15.0) or 15.0))
+    interval = max(0.15, float(getattr(a, "interval", 0.4) or 0.4))
+    want_win = getattr(a, "window", None)
+    want_text = getattr(a, "text", None)
+    stable = bool(getattr(a, "stable", False))
+    if not (want_win or want_text or stable):
+        raise CuError("CU_BAD_ARG", "wait-for 至少给 --window / --text / --stable 之一")
+    last = None
+    stable_hits = 0
+    probes = 0
+    while True:
+        probes += 1
+        hit = False
+        detail = ""
+        if want_win:
+            wins = [w for w in enum_windows() if w.match(want_win)]
+            if wins:
+                hit = True
+                detail = "窗口 %r 已出现" % wins[0].title[:30]
+        if not hit and want_text:
+            try:
+                snap = _uia().snapshot(None, 6, 60)
+                names = " ".join(str(it.get("name") or "") for it in snap.get("refs") or [])
+                if want_text in names:
+                    hit = True
+                    detail = "文字已出现"
+            except CuError:
+                pass
+        if not hit and stable:
+            fp = _screen_fp()
+            if last is not None and not _fp_moved(fp, last):
+                stable_hits += 1
+                if stable_hits >= 2:
+                    hit = True
+                    detail = "画面已稳定"
+            else:
+                stable_hits = 0
+            last = fp
+        if hit:
+            dt = time.time() - t0
+            if getattr(a, "as_json", False):
+                return [json.dumps({"ok": True, "waited": round(dt, 2),
+                                    "probes": probes, "detail": detail},
+                                   ensure_ascii=False)]
+            return ["等了 %.2fs（%d 次探测）：%s" % (dt, probes, detail)]
+        if time.time() - t0 > timeout:
+            raise CuError("CU_TIMEOUT",
+                          "等了 %.1fs 条件仍不成立（%s）。别继续瞎点：先 shot 看一眼当前界面，"
+                          "再决定是换条件还是问用户。"
+                          % (timeout, want_text or want_win or "画面稳定"))
+        time.sleep(interval)
+
+
+def _fmt_snapshot(snap):
+    refs = snap.get("refs") or []
+    win = (snap.get("window") or {}).get("name") or "?"
+    lines = ["UIA 快照 gen=%s 窗口「%s」 %d 个元素%s"
+             % (snap.get("gen"), win[:28], len(refs),
+                "（已截断，缩 --depth/--limit 或指定 --window）"
+                if snap.get("truncated") else "")]
+    for it in refs:
+        extra = ""
+        if it.get("value"):
+            extra = " value=%r" % str(it["value"])[:30]
+        lines.append("  %-6s %-13s %-30s 点这里: element %s --click%s"
+                     % (it.get("ref"), it.get("role"), str(it.get("name"))[:30],
+                        it.get("ref"), extra))
+    lines.append("（refs 只在下一次 UI 变化前有效；能用 shot+坐标就用 shot，快得多）")
+    return lines
+
+
+def _is_overlay(w):
+    """本插件自己的提示层窗口（cu-border/cu-logo/...）。"""
+    return str(w.title).startswith("cu-")
+
+
+def window_stack(include_overlay=False):
+    """可见顶层窗口，**按 Z 序从最上层到最下层**。
+
+    模型最大的翻车点是"照着上一张截图点下去，点到了压在它上面的另一个窗口"。
+    这份表就是给它用来判断"我要点的东西现在真的在最上面吗"。
+    默认丢掉本插件自己的提示层和 0 尺寸辅助窗——它们只会把表撑长。
+    """
+    fg = u32.GetForegroundWindow()
+    mons = monitors()
+    rows = []
+    for w in enum_windows():
+        try:
+            x, y, cw, ch = window_rect(w.hwnd)
+        except CuError:
+            continue
+        if cw <= 1 or ch <= 1:
+            continue
+        if _is_overlay(w) and not include_overlay:
+            continue
+        minimized = bool(u32.IsIconic(w.hwnd))
+        full = (not minimized) and any(
+            abs(x - mx) <= 16 and abs(y - my) <= 16 and cw >= mw - 32 and ch >= mh - 32
+            for mx, my, mw, mh, _primary in mons)
+        rows.append({
+            "z": len(rows), "hwnd": w.hwnd, "title": w.title,
+            "exe": w.exe.split("\\")[-1] if w.exe else "",
+            "rect": [x, y, cw, ch], "minimized": minimized,
+            "fullscreen": full, "foreground": w.hwnd == fg,
+            "overlay": _is_overlay(w),
+        })
+    return rows
+
+
+def occluders(hwnd, rect):
+    """压在这个窗口**上面**、并且和它的矩形相交的可见窗口（Z 序在前）。"""
+    x, y, w, h = rect
+    out = []
+    for row in window_stack():
+        if row["hwnd"] == hwnd:
+            break
+        if row["minimized"]:
+            continue
+        ox, oy, ow, oh = row["rect"]
+        ix0, iy0 = max(x, ox), max(y, oy)
+        ix1, iy1 = min(x + w, ox + ow), min(y + h, oy + oh)
+        if ix1 - ix0 > 2 and iy1 - iy0 > 2:
+            out.append(row)
+    return out
 
 
 def focus(pattern):
@@ -1403,6 +1558,22 @@ def focus_cc(pattern=None):
                       "找不到 DSH 界面窗口，用 cu.py windows 看看，或 cu.py focus-cc <标题子串>")
     t = hits[0]
     return t, _force_foreground(t.hwnd)
+
+
+def cc_foreground(pattern=None):
+    """DSH 界面现在是不是最前面那个窗口。返回 (window, bool)。
+
+    用户看不见后台窗口里的字，所以"通过 DSH 跟用户说话"必须以前台为前提。
+    """
+    wins = enum_windows()
+    if pattern:
+        hits = [w for w in wins if w.match(pattern)]
+    else:
+        hits = [w for w in wins if w.exe in HOST_EXES]
+        hits.sort(key=lambda w: HOST_EXES.index(w.exe))
+    if not hits:
+        return None, False
+    return hits[0], u32.GetForegroundWindow() == hits[0].hwnd
 
 
 def start_apps():
@@ -1790,7 +1961,7 @@ def _validate_png(png, width=None, height=None):
     return pw, ph
 
 
-def capture_png(long_edge=1280, region=None, grid=True):
+def capture_png(long_edge=1600, region=None, grid=True, upscale=False, norm=None):
     """只抓图、不落盘。返回 (png_bytes, meta)。
 
     抽出来是为了让常驻服务能把 PNG 直接塞进图片帧（不落临时文件），
@@ -1810,7 +1981,8 @@ def capture_png(long_edge=1280, region=None, grid=True):
                           "改用 shot --window <窗口名>（走 PrintWindow）。原始错误：%s"
                           % (e or type(e).__name__))
         raise CuError("CU_SHOT_FAIL", str(e) or type(e).__name__)
-    return _encode_png_img(img, long_edge, region, "gdi", grid=grid)
+    return _encode_png_img(img, long_edge, region, "gdi", grid=grid,
+                           upscale=upscale, norm=norm)
 
 
 # ---------------------------------------------------------------- PrintWindow 后端
@@ -1956,15 +2128,20 @@ def capture_window_png(hwnd):
             _RDC(hwnd, hwnd_dc)
 
 
-def _grid_overlay(img):
+def _grid_overlay(img, norm=None):
     """在截图上打 0-1000 归一化网格，方便模型按刻度取坐标。
 
-    为什么需要：模型看到的图被缩到长边 1280，靠肉眼估"按钮在图的百分之几"
+    为什么需要：模型看到的图被缩到长边 1600，靠肉眼估"按钮在图的百分之几"
     误差常常有 2-4%，在计算器这种按钮密集的界面上就是点空。网格把"读图"
     变成"读刻度"，误差压到 1% 以内（=10 个归一化单位）。
+
+    norm=(x0, y0, span_x, span_y)：zoom 时传入裁剪区在**整屏**上的归一化范围，
+    刻度就标全局坐标而不是 0-1000 局部坐标——否则模型会按 0-900 读，
+    点出去差着一半屏幕。
     """
     from PIL import Image, ImageDraw, ImageFont
     w, h = img.size
+    gx0, gy0, gsx, gsy = norm if norm else (0.0, 0.0, 1000.0, 1000.0)
     lay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     d = ImageDraw.Draw(lay)
     try:
@@ -1985,9 +2162,12 @@ def _grid_overlay(img):
             d.line((xx + 3, y + 1, min(w, xx + 7), y + 1), fill=(255, 255, 255, 150), width=1)
     # 刻度：顶部与左侧各标一次（100..900），带深色胶囊保证两种底色都看得清
     for i in range(1, 10):
-        val = i * 100
         px, py = int(w * i / 10.0), int(h * i / 10.0)
-        for tx, ty in ((px, 2), (2, py)):
+        xv = int(round(gx0 + gsx * i / 10.0))
+        yv = int(round(gy0 + gsy * i / 10.0))
+        for tx, ty, val in ((px, 2, xv), (2, py, yv)):
+            if not 0 <= val <= 1000:
+                continue
             tb = d.textbbox((0, 0), str(val), font=font)
             tw, th = tb[2] - tb[0], tb[3] - tb[1]
             d.rounded_rectangle((tx - 2, ty - 1, tx + tw + 4, ty + th + 4),
@@ -1998,19 +2178,29 @@ def _grid_overlay(img):
     return base.convert("RGB")
 
 
-def _encode_png_img(img, long_edge, region=None, capture_path="gdi", grid=True):
+def _encode_png_img(img, long_edge, region=None, capture_path="gdi", grid=True,
+                    upscale=False, norm=None):
     """把 PIL 图编码成 PNG 并产出 meta。缩放/token 估算口径只有这一处。"""
+    from PIL import Image          # 缩放要用 Image.LANCZOS，模块级没引入
     src_w, src_h = img.size
     scale = 1.0
     if long_edge and max(src_w, src_h) > long_edge:
         k = long_edge / float(max(src_w, src_h))
         img = img.resize((max(1, int(src_w * k)), max(1, int(src_h * k))))
         scale = k
+    elif upscale and long_edge and max(src_w, src_h) < long_edge:
+        # zoom 专用：裁出来的小区域放大到长边预算。放大不产生新细节，
+        # 但能避免下游vision编码把整屏缩到看不清小控件。
+        k = long_edge / float(max(src_w, src_h))
+        if k > 1.0:
+            img = img.resize((max(1, int(src_w * k)), max(1, int(src_h * k))),
+                             Image.LANCZOS)
+            scale = k
     if img.size[0] <= 0 or img.size[1] <= 0:
         raise CuError("CU_SHOT_FAIL", "截出来的图是空的（%dx%d）" % img.size)
     if grid:
         try:
-            img = _grid_overlay(img)
+            img = _grid_overlay(img, norm)
         except Exception:                                 # noqa: BLE001
             pass                                          # 画坏了也不能让截图失败
     lit = _lit_ratio(img)
@@ -2059,6 +2249,42 @@ def capture_shot(a):
                           % win.title[:24])
     le = _shot_le(a)      # 统一决策点，顺带完成 --long 的校验
 
+    # zoom：以 --at 为中心截一小块，再放大到长边预算。
+    # 整屏缩到 1600 后，三点菜单/关闭按钮这种 12-16px 的控件只剩几个像素，
+    # 模型既看不见也点不准；裁 30% 屏再放大，密度立刻翻三倍。
+    at = getattr(a, "at", None)
+    span = float(getattr(a, "span", 0) or 0)
+    if at and span > 0:
+        try:
+            nx, ny = [float(v) for v in str(at).replace("，", ",").split(",")[:2]]
+        except (TypeError, ValueError):
+            raise CuError("CU_BAD_ARG",
+                          '--at 要写成 "x,y"（0-1000 归一化），收到 %r' % (at,))
+        if not (0 <= nx <= 1000 and 0 <= ny <= 1000):
+            raise CuError("CU_BAD_ARG", "--at 的 x/y 要在 0..1000，收到 %s" % at)
+        vx, vy, vw, vh = screen()
+        cx, cy = to_px(nx, ny)
+        half_w = max(40, span / 2000.0 * vw)
+        half_h = max(24, span / 2000.0 * vh)
+        x0 = max(vx, int(cx - half_w))
+        y0 = max(vy, int(cy - half_h))
+        x1 = min(vx + vw, int(cx + half_w))
+        y1 = min(vy + vh, int(cy + half_h))
+        if x1 - x0 < 40 or y1 - y0 < 40:
+            raise CuError("CU_BAD_ARG",
+                          "zoom 区域太小（%dx%d 像素），把 --span 调大一点"
+                          % (x1 - x0, y1 - y0))
+        nx0 = round((x0 - vx) * 1000.0 / max(1, vw), 1)
+        ny0 = round((y0 - vy) * 1000.0 / max(1, vh), 1)
+        nsx = round((x1 - x0) * 1000.0 / max(1, vw), 1)
+        nsy = round((y1 - y0) * 1000.0 / max(1, vh), 1)
+        png, meta = capture_png(le, (x0, y0, x1, y1),
+                                grid=getattr(a, "grid", True), upscale=True,
+                                norm=(nx0, ny0, nsx, nsy))
+        meta["zoom"] = {"center": [round(nx, 1), round(ny, 1)], "span": span,
+                        "bounds": [nx0, ny0, round(nx0 + nsx, 1), round(ny0 + nsy, 1)]}
+        return png, meta
+
     # 非输入桌面（隔离桌面）上 GDI 抓不到屏幕，而且 `ImageGrab.grab()` 在那里
     # 可能**直接卡住**（实测把整条服务挂死到超时）。所以先判桌面，再决定要不要抓：
     # 有窗口就走 PrintWindow（不依赖屏幕），没窗口就明确报错，不硬试。
@@ -2068,6 +2294,29 @@ def capture_shot(a):
                       "改用 shot window=<窗口名>（PrintWindow，不依赖屏幕）。")
 
     if win is not None:
+        # 默认语义：截"用户此刻真正看到的那部分屏幕"，哪怕最上面是别的窗口。
+        # 模型最常见的事故是照着窗口自己的画面点，而它其实已被压在下面。
+        # 需要窗口本体（哪怕被遮挡）时才显式要 window_only。
+        if not getattr(a, "window_only", False) and on_input_desktop():
+            wx, wy, ww, wh = frame_rect(win.hwnd)
+            region = [wx, wy, wx + ww, wy + wh]
+            r2 = getattr(a, "region", None)
+            if r2 is not None:
+                region = list(_intersect(_region_arg(r2, "--region"), tuple(region)))
+            try:
+                png, meta = capture_png(le, tuple(region),
+                                        grid=getattr(a, "grid", True))
+                meta["window"] = win.title[:38]
+                meta["capture_path"] = "screen"
+                meta["window_foreground"] = (win.hwnd == foreground_window())
+                occ = occluders(win.hwnd, (wx, wy, ww, wh))
+                if occ:
+                    meta["covered_by"] = [
+                        {"title": o["title"][:24], "exe": o["exe"],
+                         "rect": o["rect"]} for o in occ[:4]]
+                return png, meta
+            except CuError:
+                pass          # 截屏失败再退回 PrintWindow
         try:
             img, _ok = capture_window_png(win.hwnd)
             if _lit_ratio(img) > 0.01:
@@ -2141,7 +2390,7 @@ def _settle_screen(max_ms=SETTLE_MAX_WAIT_MS):
     return moved
 
 
-def shot(out=None, long_edge=1280, region=None, keep_all=False, settle=False, grid=True):
+def shot(out=None, long_edge=1600, region=None, keep_all=False, settle=False, grid=True):
     """region 给 x,y,w,h（左上角 + 宽高，不是 l,t,r,b；单位是物理像素）。
     给 long_edge 就等比缩放；长边不超过 long_edge 时保持原样（看小字要的就是这个）。
 
@@ -3187,7 +3436,7 @@ def post(window, text=None, image=None, at=None, enter=True, out=None, keep=Fals
     # 读图的钱和一次往返——这正是这个动词存在的意义。
     path = None
     if verdict.startswith("存疑") or out:
-        path = shot(out, 1280, None, False)[0]
+        path = shot(out, 1600, None, False)[0]
     return verdict, path, note, t.title
 
 
@@ -3205,13 +3454,18 @@ def _p_shot(sub):
     p = sub.add_parser("shot", help="截图，然后用 read 打开它")
     p.add_argument("--out")
     p.add_argument("--long", type=int, default=None,
-                   help="长边缩到 N。全屏默认 1280；只要布局可给 800（省一半图像 token）")
+                   help="长边缩到 N。全屏默认 1600；只要布局可给 800（省一半图像 token）")
     p.add_argument("--region", help="x,y,w,h 只截一块（物理像素；长边≤1568 时 1:1）")
-    p.add_argument("--window", help="只截某个窗口（每次调用现读它的位置，窗口挪了也对）")
+    p.add_argument("--window", help="只截某个窗口（默认截该矩形内**屏幕真实显示**的画面，会被上层窗口挡住）")
+    p.add_argument("--window-only", action="store_true", dest="window_only",
+                   help="截窗口本体（PrintWindow，被遮挡也只看得到它自己）——排查遮挡/取证时才用")
     p.add_argument("--full", action="store_true", help="不缩放，出原分辨率")
     p.add_argument("--keep-all", action="store_true", help="不清理旧截图")
     p.add_argument("--settle", action="store_true",
                    help="先探屏幕是否还在动；撞上动画/过渡就等落定后补截一张")
+    p.add_argument("--at", help="zoom 用：归一化中心 x,y（0-1000），配合 --span")
+    p.add_argument("--span", type=float, default=0,
+                   help="zoom 用：以 --at 为中心截多大一块（归一化单位，默认 300=屏宽 30%%）")
     p.add_argument("--no-grid", action="store_false", dest="grid", default=True,
                    help="不打 0-1000 归一化网格（默认打，方便按刻度取坐标）")
     p.add_argument("--emit-binary", action="store_true", dest="emit_binary",
@@ -3292,6 +3546,8 @@ def build_parser():
     p.add_argument("--all", action="store_true", dest="show_hidden",
                    help="连**隐藏**窗口一起列（被收进托盘的会标出来）——"
                         "找不到某个应用时先用它确认是不是还活着，别急着重启")
+    p.add_argument("--json", action="store_true", dest="as_json",
+                   help="输出 JSON（给工具用）")
 
     p = sub.add_parser("rect", help="窗口在屏幕上的位置（算 --region 用）")
     p.add_argument("pattern")
@@ -3314,6 +3570,20 @@ def build_parser():
     p.add_argument("--index", type=int, help="只返回第 N 个候选（0 起）")
     p.add_argument("--click", action="store_true", help="直接点第一个匹配")
     p.add_argument("--limit", type=int, default=20)
+    p.add_argument("--json", action="store_true", dest="as_json")
+
+    p = sub.add_parser("snapshot", help="前台窗口的元素快照（语义定位；1–7 秒，能不用就不用）")
+    p.add_argument("--window", help="默认当前前台窗口")
+    p.add_argument("--depth", type=int, default=8)
+    p.add_argument("--limit", type=int, default=120)
+    p.add_argument("--json", action="store_true", dest="as_json")
+
+    p = sub.add_parser("wait-for", help="等条件成立再返回（省回合，不截图）")
+    p.add_argument("--window", help="等这个窗口出现（标题/进程名子串）")
+    p.add_argument("--text", help="等这段文字出现在前台窗口的 UIA 树里")
+    p.add_argument("--stable", action="store_true", help="等画面停止变化")
+    p.add_argument("--timeout", type=float, default=15.0)
+    p.add_argument("--interval", type=float, default=0.4)
     p.add_argument("--json", action="store_true", dest="as_json")
 
     # ---- app.*：对齐豆包 app.is_running / app.resize / app.terminate ----
@@ -3352,6 +3622,8 @@ def build_parser():
     p.add_argument("ref", help="形如 e12，或上一次 state-capture 里的完整 ref")
     p.add_argument("--click", action="store_true", help="点它（不看 pattern，只点中心）")
     p.add_argument("--invoke", action="store_true", help="走 InvokePattern")
+    p.add_argument("--no-glide", dest="no_glide", action="store_true",
+                   help="UIA 动作前不把指针移过去（默认会先平滑移动，让用户看得见）")
     p.add_argument("--set-value", dest="set_value", help="走 ValuePattern 写值")
     p.add_argument("--set-focus", action="store_true", dest="set_focus")
     p.add_argument("--toggle", action="store_true", help="走 TogglePattern（幂等：先读状态）")
@@ -3521,7 +3793,7 @@ def _shot_le(a):
         return a.long
     # 区域截图默认保持 1:1（看小字），只在超过下游模型的 1568px 长边上限时才缩；
     # 再大也会被下游降采样，白占文件体积。
-    return 1568 if getattr(a, "region", None) else 1280
+    return 1568 if getattr(a, "region", None) else 1600
 
 
 def resolve_shot_region(a):
@@ -3786,6 +4058,7 @@ UNGUARDED_CMDS = {
     "shot", "windows", "rect", "apps", "find", "app-is-running", "hybrid-programs",
     "clip", "save-image", "where", "wait", "probe", "doctor", "setup",
     "state-capture", "element-at", "resync", "码", "口径", "静默", "batch",
+    "snapshot", "wait-for",
     "watch", "盯", "收", "瞧",
     # 起进程不注入输入、不置前
     "spawn",
@@ -3885,6 +4158,11 @@ def run(a):
         lines = ["%s  %dx%d  源 %s  缩放 %.3f  %.0fKB  约 %d 图像 token%s  [%s]"
                  % (out, size[0], size[1], src, scale, nb / 1024.0,
                     meta["estimatedImageTokens"], win_note, backend)]
+        cover = meta.get("covered_by") or []
+        if cover:
+            lines.append("⚠ 这张图里压在目标上面的是：%s —— 你看到的是它们，不是那个窗口"
+                         % "、".join("「%s」" % (c.get("title") or c.get("exe") or "?")[:24]
+                                    for c in cover[:4]))
         if lit < 0.01:
             if region:
                 lines.append("[CU_BLACK] 这块区域几乎全黑（非黑像素 %.1f%%）。"
@@ -3918,7 +4196,23 @@ def run(a):
                     % (x, y, (round(a.x, 2), round(a.y, 2)))]
         x, y = click(a.x, a.y, a.right, a.double, a.triple)
         what = "三击" if a.triple else ("双击" if a.double else ("右键" if a.right else "点击"))
-        return ["%s 归一化(%.2f,%.2f) -> 像素(%d,%d)" % (what, a.x, a.y, x, y)]
+        line = "%s 归一化(%.2f,%.2f) -> 像素(%d,%d)" % (what, a.x, a.y, x, y)
+        # 顺手报一下"光标落点下面是什么"：点偏了模型当步就能看出来，
+        # 不必等到下一次截图才发现点空（实测 uia.at 约 0.4s，可用环境变量关掉）。
+        if os.environ.get("DSH_CU_CLICK_INSPECT", "1") != "0" and os.environ.get("DSH_CU_TEST") != "1":
+            try:
+                hit = _uia().at(x, y)
+                el = (hit or {}).get("element") or {}
+                role = str(el.get("role") or "未知元素")
+                nm = str(el.get("name") or "").strip()
+                if nm:
+                    line += "\n光标下：%s「%s」%s" % (role, nm[:24],
+                                                     "" if el.get("enabled", True) else "（当前不可用）")
+                else:
+                    line += "\n光标下：%s（没有名称，可能点的是空白/画布）" % role
+            except Exception:
+                pass
+        return [line]
 
     if a.cmd == "drag":
         r = drag(a.x1, a.y1, a.x2, a.y2, a.ms)
@@ -4019,27 +4313,35 @@ def run(a):
 
     if a.cmd == "windows":
         pat = a.pattern
-        if getattr(a, "show_hidden", False):
-            wins = [w for w in enum_windows(visible_only=False) if not pat or w.match(pat)]
-        else:
-            wins = find_windows(pat) if pat else enum_windows()
-        if not wins:
+        rows = window_stack()
+        if not getattr(a, "show_hidden", False):
+            rows = [r for r in rows if not r["minimized"]]
+        if pat:
+            rows = [r for r in rows if pat.lower() in (r["title"] or "").lower()
+                    or pat.lower() in (r["exe"] or "").lower()]
+        if not rows:
             raise CuError("CU_NO_WINDOW",
                           "没有匹配的窗口" + ("（连隐藏的也没有）"
                                           if getattr(a, "show_hidden", False)
                                           else "（被收进托盘的看不见，加 --all 试）"))
-        lines = ["%-10s %-22s %-13s %s" % ("hwnd", "进程", "注入", "标题")]
-        for w in wins:
-            ok, lvl = injectable(w.pid)
-            note = "" if ctypes.windll.user32.IsWindowVisible(w.hwnd)                 else "  ← 隐藏：多半在托盘里，别急着重启它"
-            lines.append("%-10d %-22s %-13s %s%s" % (w.hwnd, (w.exe or "?")[:20],
-                                                     "OK" if ok else "★UIPI " + lvl,
-                                                     w.title[:52], note))
-        # 不带关键词的 --all 能吐出两百多行（大量是无名的辅助窗口）。别让它整坨进上下文。
-        if not pat and len(lines) > 41:
-            more = len(lines) - 41
-            lines = lines[:41] + ["……还有 %d 个窗口。**给个关键词**再看（如 "
-                                  "`windows --all 微信`），别把整张表拉进上下文。" % more]
+        if getattr(a, "as_json", False):
+            return [json.dumps(rows, ensure_ascii=False)]
+        lines = ["Z 序（0=最上层）：截哪块之前先看这张表，别对着被压住的窗口点",
+                 "%-3s %-10s %-16s %-5s %-4s %-4s %-22s %s"
+                 % ("z", "hwnd", "进程", "注入", "全屏", "前台", "矩形(x,y,w,h)", "标题")]
+        for r in rows[:25]:
+            ok, lvl = injectable(_pid_of(r["hwnd"]))
+            x, y, w, h = r["rect"]
+            lines.append("%-3d %-10d %-16s %-5s %-4s %-4s %-22s %s%s"
+                         % (r["z"], r["hwnd"], (r["exe"] or "?")[:14],
+                            "OK" if ok else "UIPI", "是" if r["fullscreen"] else "-",
+                            "★" if r["foreground"] else "-",
+                            "%d,%d,%d,%d" % (x, y, w, h),
+                            ("[覆盖层] " if r["overlay"] else "") + (r["title"] or "")[:48],
+                            "  ← 隐藏" if r["minimized"] else ""))
+        if len(rows) > 25:
+            lines.append("……还有 %d 个窗口。给个关键词再看（如 `windows 微信`），"
+                         "别把整张表拉进上下文。" % (len(rows) - 25))
         return lines
 
     if a.cmd == "focus":
@@ -4271,6 +4573,21 @@ def run(a):
                     else "否（锁屏或 UAC 安全桌面上，注入与截图都不可用）"))
         return lines
 
+    if a.cmd == "snapshot":
+        win = getattr(a, "window", None)
+        if not win:
+            fw = foreground_window()
+            if fw is not None:
+                win = fw.title
+        uia = _uia()
+        snap = uia.snapshot(win, a.depth, a.limit)
+        if getattr(a, "as_json", False):
+            return [json.dumps(snap, ensure_ascii=False)]
+        return _fmt_snapshot(snap)
+
+    if a.cmd == "wait-for":
+        return wait_for(a)
+
     if a.cmd == "state-capture":
         uia = _uia()
         snap = uia.snapshot(a.window, a.depth, a.limit)
@@ -4328,6 +4645,18 @@ def run(a):
                     % (a.ref, x, y, nx, ny, el.get("role"), el.get("name"))]
         action = acts[0]
         value = a.set_value if action == "set_value" else a.set_range_value
+        # 指针要先"真的"移过去：UIA pattern 能直接触发控件，但用户看到的指针
+        # 会一直停在别处，和"我在操作这台电脑"的预期对不上（2026-11-24 实测）。
+        # 只对按钮类动作做，移不过去（离屏/最小化）就跳过，不能因此失败。
+        if action in ("invoke", "toggle", "select", "add_to_selection",
+                      "expand", "collapse") and not getattr(a, "no_glide", False):
+            try:
+                cx, cy, _el = uia.center_of(a.ref)
+                if cx is not None and cy is not None:
+                    _glide(cx, cy)
+                    time.sleep(0.04)
+            except CuError:
+                pass
         r = uia.act(a.ref, action, value)
         if r.get("noop"):
             return ["element %s %s 已经是 %s，未重复切换" % (a.ref, action, r.get("state"))]

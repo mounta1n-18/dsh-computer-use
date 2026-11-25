@@ -43,7 +43,7 @@ WATCH_CMDS = ("盯", "watch")
 import cu  # noqa: E402  （cu 在 import 时会设置 DPI 感知与三个流的 UTF-8）
 
 PROTOCOL_VERSION = 1
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 PIPE_NAME = r"\\.\pipe\dsh-computer-use"
 
 KIND_JSON = 0
@@ -77,6 +77,13 @@ _STOP_DETAIL = {
     "turn-end": "本回合结束，cu 随之关闭",
     "manual": "用户手动关闭了 cu",
     "stop": "cu 已关闭",
+}
+
+# 客户端推来的阶段词 -> 上屏词。原则：只留三个稳定词，细节一律并进粗类，
+# 免得模型两秒一步、屏幕上一秒变一次，用户读不过来。
+_PHASE_WORD = {
+    "操作中": "操作", "观察中": "操作", "后台执行中": "操作", "申请中": "操作",
+    "思考中": "思考", "等待中": "等待", "提问中": "等待",
 }
 
 
@@ -609,6 +616,21 @@ class Server:
         self._logo_label = None
         self._phase_at = 0.0
         self._logo_color = None
+        # 低频状态机：屏幕上显示的词、上次换词时间、待确认的候选词。
+        self._label = "待命"
+        self._label_at = time.time()
+        self._cand = None
+        self._cand_at = 0.0
+        # 留言投递反馈（绿/红环 + 短词），3 秒内优先于普通状态显示。
+        self._relay_label = ""
+        self._relay_color = ""
+        self._relay_until = 0.0
+        # 上一次"权威状态"推给提示层时的快照；每秒对账一次，防止漏发/旧进程画错。
+        self._pushed = None
+        # 心跳：最后一次"确实有动静"的时刻（动作/阶段字/留言/回复都会刷新它）。
+        # 只记时间戳，零开销；用来识别"捏着租约但一步没走"的卡死。
+        self._beat_at = time.time()
+        self._logo_sweep = True
         # agent 亲手写的自我介绍 + 本次使用强度：activate 必填，用户点同意之前就要看见。
         self.intro = ""
         self.intensity = ""
@@ -707,10 +729,11 @@ class Server:
             bits.append("强度 %s" % INTENSITY_LABELS[self.intensity])
         return " · ".join(bits) or "（未上报会话）"
 
-    def _logo(self, state=None, label=None, color=None):
+    def _logo(self, state=None, label=None, color=None, sweep=None):
         """右下角鲸鱼：状态字 + 呼吸环颜色。
 
         color=None 表示"没改"；color="" 表示回到状态默认色（蓝/灰）。
+        sweep=False 关掉状态词上的光泽——只有"确实在有序跑"时才让它扫。
         """
         if state is not None:
             self._logo_state = state
@@ -718,13 +741,17 @@ class Server:
             self._logo_label = label or None
         if color is not None:
             self._logo_color = color or None
+        if sweep is not None:
+            self._logo_sweep = bool(sweep)
         self.overlay.send(cmd="logo", on=True, state=self._logo_state,
-                          label=self._logo_label, color=self._logo_color)
+                          label=self._logo_label, color=self._logo_color,
+                          sweep=self._logo_sweep)
 
     def _show_active(self, owner, banner_seconds=5):
         # 新一轮激活：上一次"为什么关"的账不能带到这一轮
         self.stop_reason = self.stop_detail = ""
         self.revoke_reason = self.revoke_detail = ""
+        self._label, self._label_at, self._cand = "待命", time.time(), None
         self.overlay.send(cmd="border", on=True, color="#4D6BFE", alpha=0.42)
         self.overlay.send(cmd="halo", on=True)
         self._logo(state="active")
@@ -737,6 +764,8 @@ class Server:
             seconds=int(banner_seconds), buttons=False, tone="active")
         if banner_seconds:
             self._later(banner_seconds + 0.2, lambda: self.overlay.send(cmd="hide_banner"))
+        self._pushed = None
+        self._beat_status()
 
     def _show_paused(self):
         """暂停态：灰边 + 鲸鱼状态字，不占顶部横幅。
@@ -749,10 +778,61 @@ class Server:
         self.overlay.send(cmd="halo", on=False)
         self._logo(state="paused", label="", color="")
         self.overlay.send(cmd="hide_banner")
+        self._pushed = None
+        self._beat_status()
 
     def _show_idle(self):
         """交还/急停之后：所有特效立刻消失，用户可确定现在轮到自己了。"""
+        self._pushed = None
         self.overlay.send(cmd="off")
+
+    def _want_status(self):
+        """提示层此刻**应该**是什么样：(state, label, 边框色, 要不要光晕)。
+
+        这是唯一的权威口径：谁都不去猜"屏幕上现在画着什么"，只问租约和暂停位。
+        None 表示此刻不该有任何提示。
+        """
+        if not self.control.lease:
+            return None
+        now = time.time()
+        if self.control.paused:
+            # 暂停有三种原因，状态词必须说清是哪一种，否则用户只知道"停了"。
+            if self.dialog_open:
+                label = "询问"
+            elif self.pending_reply:
+                label = "待答"
+            else:
+                label = "暂停"
+            return ("paused", label, "#8A8F98", False, False)
+        if now < self._relay_until and self._relay_label:
+            return ("active", self._relay_label, self._relay_color or "#4D6BFE", True, True)
+        # 心跳：最后一条动静（动作、阶段字、留言、回复）有多久了。超过 STALL_SECS
+        # 还捏着租约却一步没走，多半是模型那头卡住/网络断了——把"卡住"显示出来，
+        # 并且关掉光泽（静止的界面不该假装还在动）。
+        gap = now - self._beat_at
+        if gap > self.STALL_SECS:
+            return ("active", "停滞 %.0fs" % gap, "#4D6BFE", True, False)
+        return ("active", self._label, "#4D6BFE", True, True)
+
+    def _beat_status(self):
+        """每秒和提示层对一次账（幂等）。
+
+        为什么需要：阶段字是事件驱动的，漏一条（工具异常、进程重启、旧提示层
+        还活着）屏幕上就会停在错误状态——用户见过"蓝边框 + 已暂停"。
+        这里以权威状态为准整套重发，不依赖任何一次事件成功送达。
+        """
+        want = self._want_status()
+        if want == self._pushed:
+            return
+        self._pushed = want
+        if want is None:
+            self.overlay.send(cmd="off")
+            return
+        state, label, color, halo, sweep = want
+        self.overlay.send(cmd="border", on=True, color=color,
+                          alpha=0.42 if state == "active" else 0.32)
+        self.overlay.send(cmd="halo", on=halo)
+        self._logo(state=state, label=label, color="", sweep=sweep)
 
     # ---- 暂停 / logo 留言 ----
     def _pause_toggle(self, why="hotkey"):
@@ -922,26 +1002,45 @@ class Server:
         return {"resumed": True, "paused": False}
 
     def _phase(self, req):
-        """鲸鱼下方的状态字：操作中 / 思考中 / 后台执行中 / 观察中 / 等待中。
+        """鲸鱼下方的状态词：思考 / 操作 / 等待。
 
         这些阶段只有 agent 侧知道（它在想还是在点），所以由客户端按调用阶段推过来。
+        只做一次粗粒度归并（7 个细分词 → 3 个），然后**立刻上屏**：
+        用户要的是实时，不是"不闪"；防跳变交给状态词上的光束特效去提示"它还在动"。
         """
         if not self.control.lease or self.control.paused:
             return {"phase": None}
-        label = str(req.get("label") or "")[:10]
+        raw = str(req.get("label") or "")[:10]
+        label = _PHASE_WORD.get(raw, raw)
+        self._beat()
         self._phase_at = time.time()
-        self._logo(label=label)
-        return {"phase": label}
+        if label and label != self._label:
+            self._label = label
+            self._label_at = self._phase_at
+            # 立刻上屏：不靠下一次 ticker（1s 粒度）追，用户看到的是实时状态。
+            self._beat_status()
+        return {"phase": self._label}
+
+    def _beat(self):
+        """零开销心跳：任何"确实往前走了一步"的事件都调用它。"""
+        self._beat_at = time.time()
+
+    def _stable_label(self, now):
+        """保留旧接口：直接返回当前词（迟滞已按用户要求移除）。"""
+        return self._label
 
     def _relay(self, req):
-        """用户留言的递送状态：sent=已送达模型（绿），failed=递送失败（红），clear=复位。"""
+        """用户留言的递送状态：sent=送达（绿），failed=失败（红），clear=复位。"""
         st = str(req.get("state") or "").lower()
         if st == "sent":
-            self._logo(color="#34C759", label="已送达")
+            self._relay_label, self._relay_color = "送达", "#34C759"
         elif st == "failed":
-            self._logo(color="#FF3B30", label="递送失败")
+            self._relay_label, self._relay_color = "失败", "#FF3B30"
         else:
-            self._logo(color="", label="")
+            self._relay_label, self._relay_color = "", ""
+        self._relay_until = time.time() + 3.0 if self._relay_label else 0.0
+        self._logo(color=self._relay_color, label=self._relay_label)
+        self._pushed = None
         return {"relay": st or "clear"}
 
     # ---- 用户同意 ----
@@ -1028,8 +1127,8 @@ class Server:
                              "activate 必须带 intensity，三选一：script_main（主要脚本实现，键鼠零星使用）/ "
                              "unknown（我不知道，视情况而定）/ gui_main（主要键鼠实现，脚本零星使用）。")
         self.intro, self.intensity = intro, intensity
-        for key, attr, lo, hi in (("idle_ttl", "idle_ttl", 2, 1800),
-                                  ("max_ttl", "max_ttl", 60, 28800)):
+        for key, attr, lo, hi in (("idle_ttl", "idle_ttl", 2, 3600),
+                                  ("max_ttl", "max_ttl", 0, 28800)):
             if req.get(key) is not None:
                 try:
                     setattr(self.control, attr, max(lo, min(hi, float(req[key]))))
@@ -1064,8 +1163,9 @@ class Server:
             cmd="banner",
             text=("「%s」想接管鼠标和键盘" % self.intro) if self.intro else "有 agent 想接管鼠标和键盘",
             sub=self._session_line(),
-            note="同意后它会操作这台电脑；完成后自动交还，空闲 %d 分钟也会收回。"
-                 % max(1, int(self.control.idle_ttl // 60)),
+            note="同意后它会操作这台电脑；完成后自动交还，%s 没有任何操作也会收回。"
+                 % ("%d 分钟" % max(1, int(self.control.idle_ttl // 60))
+                    if self.control.idle_ttl >= 120 else "%d 秒" % int(self.control.idle_ttl)),
             seconds=30, buttons=True, tone="consent")
         if not ok:
             with self.control_lock:
@@ -1089,6 +1189,16 @@ class Server:
 
     def _deactivate(self, req):
         reason = str(req.get("reason") or "agent 完成")[:160]
+        # 硬约束：DSH 不在最前面时，用户看不见后台窗口里的任何字。
+        # 这时不许收工——先切回前台，或者改用工具侧的 reply/ask 说话。
+        if self.control.lease and not self.control.paused:
+            win, front = cu.cc_foreground()
+            if win is not None and not front:
+                raise cu.CuError(
+                    "CU_NOT_FOREGROUND",
+                    "DSH 现在不在最前面（前台是别的窗口），用户看不见你在这里说的话。"
+                    "要收工先 action=\"focus_cc\" 把 DSH 切回前台再 deactivate；"
+                    "想现在就跟用户说，用 action=\"reply\"（右下角卡片，不需要前台）。")
         if self.pending_reply:
             # 用户说了话还在等答复：不许用"收工"逃走，先把话回完（空 reply 也算回）。
             raise cu.CuError("CU_UNANSWERED", "")
@@ -1128,7 +1238,12 @@ class Server:
         action = (req.get("action") or "status").strip().lower()
         if action == "status":
             running = bool(self.overlay.proc and self.overlay.proc.poll() is None)
+            idle_gap = time.time() - self._beat_at
             return {"control": self.control.status(),
+                    "alive": {"beat_age": round(idle_gap, 1),
+                              "stalled": bool(self.control.lease) and not self.control.paused
+                                         and idle_gap > self.STALL_SECS,
+                              "threshold": self.STALL_SECS},
                     "hotkeys": {"emergency": "Ctrl+Alt+Shift+Backspace",
                                 "pause": "Ctrl+Shift+Alt",
                                 "agree": "Ctrl+Alt+Shift+Enter",
@@ -1230,7 +1345,7 @@ class Server:
                     pause_armed = True
                 else:
                     if (pause_armed and not pause_dirty
-                            and pause_since and time.time() - pause_since >= 0.08):
+                            and pause_since and time.time() - pause_since >= 0.03):
                         self._pause_toggle("hotkey")
                     pause_since = 0.0
                     pause_dirty = False
@@ -1376,6 +1491,10 @@ class Server:
 
     # ---- 给"唤醒沉睡会话"用的留言队列 ----
     CLAIM_TTL = 45.0
+
+    # 捏着租约超过这个秒数还没有任何动静，就认为"停滞"：状态字改成「停滞 Ns」并停掉
+    # 光泽。阈值取 20s：正常的"思考 + 一次工具调用"都在 10s 内，超过 20s 基本是网络/卡死。
+    STALL_SECS = 20.0
 
     def _claim_msgs(self, ids=None):
         """认领待投递留言：同一时刻只有一个消费者拿得到。
@@ -1576,24 +1695,24 @@ class Server:
                     expired = None
                     if L and not self.control.emergency:
                         now = time.time()
-                        if now > L["max_deadline"]:
+                        if self.control.max_ttl > 0 and now > L["max_deadline"]:
                             expired = "单次激活达到 %d 秒上限" % int(self.control.max_ttl)
                         elif not self.control.paused and now - L["last"] > self.control.idle_ttl:
                             # 暂停时用户正在和 agent 对话，不能因为"没调用工具"就把控制权收走
-                            expired = "空闲超过 %d 秒" % int(self.control.idle_ttl)
+                            expired = "无任何操作超过 %d 秒" % int(self.control.idle_ttl)
                         if expired:
                             self.control.revoke("expired")
                             self.revoke_reason = ("max-ttl" if expired.startswith("单次激活")
                                                   else "idle-timeout")
                             self.revoke_detail = expired + "，控制权已收回"
-                    # 阶段字防卡死：动作结束后偶尔没来得及推"思考中"，右下角会停在
-                    # "等待中"看着像死机。75 秒没有新阶段就退回默认状态字。
+                    # 状态词防卡死：动作结束后偶尔没来得及推新阶段，右下角会停在
+                    # "等待"看着像死机。90 秒没有新阶段就退回"待命"。
                     if L and not self.control.paused and not expired \
-                            and self._logo_label in ("操作中", "思考中", "等待中", "观察中",
-                                                     "提问中", "后台执行中", "申请中") \
-                            and time.time() - self._phase_at > 75:
-                        self._logo(state="active", label="")
-                        self._phase_at = time.time()
+                            and self._label in ("操作", "思考", "等待") \
+                            and time.time() - self._phase_at > 90:
+                        self._label = "待命"
+                        self._label_at = time.time()
+                        self._cand = None
                     if expired:
                         with cu.control_bypass():
                             cu.release_all()
@@ -1616,6 +1735,8 @@ class Server:
                         # 空闲/超时到期即整个退出（提示层一起撤），和手动关闭同一条路径。
                         if not self.stay_alive:
                             self._full_stop("idle-timeout")
+                    # 每秒对账：状态字/边框/光晕以这里为准，漏发或旧进程画错都能自愈。
+                    self._beat_status()
             except Exception:                                # noqa: BLE001
                 log("收权线程异常：%s" % traceback.format_exc())
             time.sleep(1.0)
@@ -1877,6 +1998,7 @@ class Server:
         # 用户下一次动手操作 = 上一条"递送失败"的红环该复位了。
         if self._logo_color:
             self._logo(color="", label="")
+        self._beat()
         argv = req.get("argv")
         line = req.get("line")
         if argv is None and line is not None:
@@ -1987,6 +2109,9 @@ class Server:
         a.long = req.get("long")
         a.full = bool(req.get("full"))
         a.grid = req.get("grid") is not False
+        a.at = req.get("at")
+        a.span = req.get("span")
+        a.window_only = bool(req.get("window_only"))
         png, meta = cu.capture_shot(a)
         if req.get("settle") and cu._settle_screen():
             # 首张正撞上动画/过渡：等落定后重截一张

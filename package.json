@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-computer-use",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "Computer-use / browser-use for DSH: resident Python service, direct PNG tool results, UIA element layer, Windows virtual desktops, CDP browser plane.",
@@ -16,6 +16,9 @@
     "scripts/**",
     "tests/**",
     "cordis.patch.yml",
+    "CHANGELOG.md",
+    "README.md",
+    "LICENSE",
     "INSTALL.md",
     "AGENT-INSTALL.md",
     "交接备忘.md"

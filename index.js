@@ -161,6 +161,24 @@ export function apply(ctx, config = {}) {
   const gateAttempts = new Map()
   const GATE_MAX_TRIES = 4
 
+  // 状态字：模型开始流式输出 = 真的在"思考中"。以前只有工具边界才推阶段，
+  // 模型在两个工具之间长时间推理时，右下角会一直停在"操作中"，看着像没反应。
+  let lastThinkPush = 0
+  if (typeof ctx.on === 'function') {
+    ctx.on('agent/assistant-stream', (frame) => {
+      try {
+        const agent = frame?.agent
+        if (!agent?.id) return
+        const now = Date.now()
+        if (now - lastThinkPush < 1200) return
+        lastThinkPush = now
+        manager.call('phase', { label: '思考中' }, { timeoutMs: 1500 }).catch(() => {})
+      } catch {
+        /* 状态字失败绝不影响主流程 */
+      }
+    })
+  }
+
   if (typeof ctx.on === 'function') {
     ctx.on('agent/turn-stopping', async ({ agent, turn } = {}) => {
       try {
